@@ -1,6 +1,10 @@
+use crate::config_ui::{SetupWizard, WizardAction};
+use crate::sessions_ui::{SessionsUi, UiAction};
 use crossterm::event::{self, Event, KeyCode, KeyEventKind, KeyModifiers};
 use crossterm::execute;
-use crossterm::terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen};
+use crossterm::terminal::{
+    disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen,
+};
 use ratatui::backend::CrosstermBackend;
 use ratatui::layout::{Alignment, Constraint, Direction, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
@@ -12,10 +16,8 @@ use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 use tokio::sync::{mpsc, oneshot};
 use tokio_util::sync::CancellationToken;
-use crate::config_ui::{SetupWizard, WizardAction};
-use crate::sessions_ui::{SessionsUi, UiAction};
 use znaide_core::config::Resolved;
-use znaide_core::llm::OpenAiClient;
+use znaide_core::llm::build_llm_client;
 use znaide_core::permissions::Mode;
 use znaide_core::session::{
     list_history_sessions_detailed, remove_session, Session, SessionEvent, SharedInbox,
@@ -36,7 +38,10 @@ enum AgentCmd {
     /// 运行时重配置(切换 provider/模型/端点/key,立即生效)
     Reconfigure(Resolved),
     /// 手动触发技能:/技能名 [参数](可能含入口脚本,由 agent 侧统一执行)
-    RunSkill { name: String, args: String },
+    RunSkill {
+        name: String,
+        args: String,
+    },
     /// 清空会话上下文与历史文件(经确认后发送)
     ClearContext,
     /// 压缩上下文(旧消息 → 摘要,腾出上下文空间)
@@ -111,7 +116,11 @@ const LOGO_TEXT: &str = "
 
 /// 拼出 Logo 的逐行文本
 fn logo_lines() -> Vec<String> {
-    LOGO_TEXT.lines().filter(|l| !l.is_empty()).map(|s| s.to_string()).collect()
+    LOGO_TEXT
+        .lines()
+        .filter(|l| !l.is_empty())
+        .map(|s| s.to_string())
+        .collect()
 }
 
 struct PermissionPrompt {
@@ -298,7 +307,11 @@ pub async fn run(
     let backend = CrosstermBackend::new(stdout);
     let mut terminal = Terminal::new(backend)?;
 
-    let llm = OpenAiClient::new(resolved)?;
+    let llm = build_llm_client(resolved)?;
+    // 协议是 Copy:spawn 前取出,免得 async move 把 `resolved` 引用整个抓进去
+    let session_protocol = resolved.protocol;
+    // 会话头开关同样 spawn 前取出(跟 provider 走的配置快照)
+    let session_header_enabled = resolved.session_header_enabled;
     let (ev_tx, mut ev_rx) = mpsc::unbounded_channel::<SessionEvent>();
     let (cmd_tx, mut cmd_rx) = mpsc::unbounded_channel::<AgentCmd>();
     // 更新进度/结果通知(update task → UI)
@@ -340,6 +353,7 @@ pub async fn run(
         let cancel = CancellationToken::new();
         let mut session = match Session::new(
             llm,
+            session_protocol,
             cwd_buf,
             mode,
             Some(ev_tx.clone()),
@@ -348,6 +362,7 @@ pub async fn run(
             start_session_id.clone(),
             mcp,
             &persona,
+            session_header_enabled,
         ) {
             Ok(s) => s,
             Err(_) => return,
@@ -445,7 +460,9 @@ pub async fn run(
     if let Some(rp) = &resume {
         items.push(MsgItem::Notice(format!(
             "▶ 正在恢复会话 {}…",
-            rp.file_stem().map(|s| s.to_string_lossy().to_string()).unwrap_or_default()
+            rp.file_stem()
+                .map(|s| s.to_string_lossy().to_string())
+                .unwrap_or_default()
         )));
         let _ = cmd_tx.send(AgentCmd::LoadHistory(rp.clone()));
     }
@@ -507,7 +524,9 @@ pub async fn run(
         items.push(MsgItem::Notice(
             "🎉 首次运行:先完成一次配置。选 AI 服务商,向导自动查询可用模型。".into(),
         ));
-        items.push(MsgItem::Notice("配置完成并验证通过前对话不可用。需要时用 /config 重开向导。".into()));
+        items.push(MsgItem::Notice(
+            "配置完成并验证通过前对话不可用。需要时用 /config 重开向导。".into(),
+        ));
         let mut w = SetupWizard::new();
         w.prefill();
         config_wizard = Some(w);
@@ -523,7 +542,9 @@ pub async fn run(
         let update_tx = update_tx.clone();
         tokio::spawn(async move {
             tokio::time::sleep(std::time::Duration::from_secs(2)).await;
-            let Ok(client) = znaide_core::update::http_client() else { return };
+            let Ok(client) = znaide_core::update::http_client() else {
+                return;
+            };
             let Ok((src, latest)) = znaide_core::update::probe_latest(&client).await else {
                 return;
             };
@@ -571,7 +592,10 @@ pub async fn run(
                 let header = Line::from(vec![
                     Span::styled(
                         " znaide ",
-                        Style::default().fg(Color::Black).bg(Color::Cyan).add_modifier(Modifier::BOLD),
+                        Style::default()
+                            .fg(Color::Black)
+                            .bg(Color::Cyan)
+                            .add_modifier(Modifier::BOLD),
                     ),
                     Span::styled(
                         format!(
@@ -635,12 +659,11 @@ pub async fn run(
 
                 // 输出框(消息区)边框 = 当前权限模式色(与输入框一致,常显不随 busy 变灰)
                 let msg_border_color = mode_color(current_mode);
-                let p = Paragraph::new(window)
-                    .block(
-                        Block::default()
-                            .borders(ratatui::widgets::Borders::ALL)
-                            .border_style(Style::default().fg(msg_border_color)),
-                    );
+                let p = Paragraph::new(window).block(
+                    Block::default()
+                        .borders(ratatui::widgets::Borders::ALL)
+                        .border_style(Style::default().fg(msg_border_color)),
+                );
                 f.render_widget(p, chunks[1]);
                 // 记录几何供鼠标事件换算(滚动条列、可视行数)
                 msg_area = chunks[1];
@@ -701,7 +724,8 @@ pub async fn run(
                 let token_info = {
                     let sum_real = token_stats.input + token_stats.output;
                     let live = busy && token_stats.round_est > 0;
-                    let out_show = token_stats.output + if live { token_stats.round_est } else { 0 };
+                    let out_show =
+                        token_stats.output + if live { token_stats.round_est } else { 0 };
                     let sum_show = sum_real + if live { token_stats.round_est } else { 0 };
                     if sum_show > 0 {
                         let mark = if live { "≈" } else { "" };
@@ -764,23 +788,20 @@ pub async fn run(
                     scroll_hint,
                     sess
                 );
-                let mut status_spans = vec![Span::styled(
-                    status,
-                    Style::default().fg(Color::DarkGray),
-                )];
+                let mut status_spans =
+                    vec![Span::styled(status, Style::default().fg(Color::DarkGray))];
                 // 上下文占用条(真实 prompt / 模型窗口),高占用变色
                 if let Some((badge, badge_color)) =
                     ctx_usage_badge(token_stats.last_prompt, ctx_window)
                 {
                     status_spans.push(Span::styled(
                         format!(" {badge}"),
-                        Style::default().fg(badge_color).add_modifier(Modifier::BOLD),
+                        Style::default()
+                            .fg(badge_color)
+                            .add_modifier(Modifier::BOLD),
                     ));
                 }
-                f.render_widget(
-                    Paragraph::new(Line::from(status_spans)),
-                    chunks[3],
-                );
+                f.render_widget(Paragraph::new(Line::from(status_spans)), chunks[3]);
                 if let Some(pp) = &permission {
                     draw_permission(f, f.area(), pp);
                 }
@@ -952,21 +973,27 @@ pub async fn run(
                         config_wizard = Some(wizard);
                     }
                     WizardAction::Exit => {
-                        items.push(MsgItem::Notice(
-                            if configured_ok {
-                                "已关闭配置向导,用 /config 可再打开。".into()
-                            } else {
-                                "⚠ 配置还没完成,对话仍不可用。用 /config 继续配置。".into()
-                            },
-                        ));
+                        items.push(MsgItem::Notice(if configured_ok {
+                            "已关闭配置向导,用 /config 可再打开。".into()
+                        } else {
+                            "⚠ 配置还没完成,对话仍不可用。用 /config 继续配置。".into()
+                        }));
                     }
-                    WizardAction::FetchModels { base_url, api_key } => {
+                    WizardAction::FetchModels {
+                        base_url,
+                        api_key,
+                        session_header,
+                    } => {
                         // 保留向导(Querying 状态),后台查询模型
                         config_wizard = Some(wizard);
                         let tx = wiz_tx.clone();
                         tokio::spawn(async move {
-                            let r =
-                                znaide_core::llm::openai::probe_models(&base_url, api_key.as_deref()).await;
+                            let r = znaide_core::llm::openai::probe_models(
+                                &base_url,
+                                api_key.as_deref(),
+                                session_header.as_deref(),
+                            )
+                            .await;
                             let _ = tx.send(WizardReply::Models(r.map_err(|e| format!("{e:#}"))));
                         });
                     }
@@ -987,7 +1014,9 @@ pub async fn run(
                 match su.on_key(k) {
                     UiAction::Exit => {
                         // 关闭窗口回到对话
-                        items.push(MsgItem::Notice("已关闭会话管理(随时 /resume 再开)。".into()));
+                        items.push(MsgItem::Notice(
+                            "已关闭会话管理(随时 /resume 再开)。".into(),
+                        ));
                     }
                     UiAction::Resume(path) => {
                         let _ = cmd_tx.send(AgentCmd::LoadHistory(path));
@@ -1057,7 +1086,8 @@ pub async fn run(
                             Some(SlashOutcome::Task(prompt)) => {
                                 if !configured_ok {
                                     items.push(MsgItem::Notice(
-                                        "⚠ 尚未完成配置,不能执行任务。先输入 /config 完成配置。".into(),
+                                        "⚠ 尚未完成配置,不能执行任务。先输入 /config 完成配置。"
+                                            .into(),
                                     ));
                                 } else {
                                     items.push(MsgItem::User(prompt.clone()));
@@ -1069,7 +1099,8 @@ pub async fn run(
                             Some(SlashOutcome::RunSkill { name, args }) => {
                                 if !configured_ok {
                                     items.push(MsgItem::Notice(
-                                        "⚠ 尚未完成配置,不能执行技能。先输入 /config 完成配置。".into(),
+                                        "⚠ 尚未完成配置,不能执行技能。先输入 /config 完成配置。"
+                                            .into(),
                                     ));
                                 } else {
                                     let _ = cmd_tx.send(AgentCmd::RunSkill { name, args });
@@ -1080,7 +1111,8 @@ pub async fn run(
                             Some(SlashOutcome::Compact) => {
                                 if !configured_ok {
                                     items.push(MsgItem::Notice(
-                                        "⚠ 尚未完成配置,不能压缩上下文。先输入 /config 完成配置。".into(),
+                                        "⚠ 尚未完成配置,不能压缩上下文。先输入 /config 完成配置。"
+                                            .into(),
                                     ));
                                 } else {
                                     let _ = cmd_tx.send(AgentCmd::Compact);
@@ -1188,7 +1220,8 @@ pub async fn run(
                             Ok(()) => {
                                 // 验证通过 → 保存并解锁
                                 let draft = w.draft();
-                                let mut cfg = znaide_core::config::Config::load().unwrap_or_default();
+                                let mut cfg =
+                                    znaide_core::config::Config::load().unwrap_or_default();
                                 // 面板里填的轮数上限一起落盘(空 = 清除,回到默认 200)
                                 cfg.max_turns = w.max_turns;
                                 // Key 来自环境变量时不写明文(留空即保持环境变量那条路)
@@ -1203,7 +1236,18 @@ pub async fn run(
                                     Some(&draft.base_url),
                                     key_arg,
                                     w.context_window,
+                                    draft.protocol,
+                                    w.session_header,
                                 );
+                                // 协议变了 → 提醒历史继续有效、异常可 /clear
+                                let proto_note = if current_resolved.protocol != draft.protocol {
+                                    format!(
+                                        "协议已切换为 {}，历史继续有效；若模型表现异常可 /clear 开新上下文。",
+                                        draft.protocol.as_str()
+                                    )
+                                } else {
+                                    String::new()
+                                };
                                 // 状态栏立即跟上新的轮数上限(命令行 --max-turns 仍优先)
                                 round_limit = effective_max_turns(max_turns);
                                 let _ = cmd_tx.send(AgentCmd::Reconfigure(draft.clone()));
@@ -1211,13 +1255,16 @@ pub async fn run(
                                 // 配置变了,窗口跟着刷新(状态栏 ctx 条用的就是它)
                                 ctx_window = current_resolved.effective_context_window();
                                 configured_ok = save_result.is_ok();
-                                w.inject_verify(true, format!(
-                                    " {} / {} 已保存并生效。",
-                                    draft.provider_name, draft.model
-                                ));
+                                w.inject_verify(
+                                    true,
+                                    format!(
+                                        " {} / {} 已保存并生效。",
+                                        draft.provider_name, draft.model
+                                    ),
+                                );
                                 items.push(MsgItem::Notice(match save_result {
                                     Ok(()) => format!(
-                                        "✔ 配置完成并已生效: {} / {}。可以开始用了。",
+                                        "✔ 配置完成并已生效: {} / {}。可以开始用了。{proto_note}",
                                         draft.provider_name, draft.model
                                     ),
                                     Err(e) => format!("⚠ 配置已生效但没存上: {e}"),
@@ -1288,7 +1335,10 @@ pub async fn run(
         // 只有"这一回合已无后续轮次"(模型给出终结答复)时,剩下的才落到这里——
         // 回合结束(busy → false)且没有模态弹窗时,逐条当作新回合发出,一条一个回合。
         // 自然结束、被 Esc 中断、回合出错中止都落在同一个 busy=false 上,队列不会卡死。
-        let modal = permission.is_some() || confirm.is_some() || config_wizard.is_some() || sessions_ui.is_some();
+        let modal = permission.is_some()
+            || confirm.is_some()
+            || config_wizard.is_some()
+            || sessions_ui.is_some();
         if let Some(next) = queue.pop_ready(!busy, modal) {
             items.push(MsgItem::User(next.clone()));
             let _ = cmd_tx.send(AgentCmd::Prompt(next));
@@ -1298,7 +1348,8 @@ pub async fn run(
         }
         // 输入补全刷新:基于最新 input/光标;前缀与位置未变时保留选中,不做磁盘 IO。
         // 向导/确认框/工作中时不触发(相关层已拦截按键,这里兜底清空状态)。
-        let completable = !busy && permission.is_none() && confirm.is_none() && config_wizard.is_none();
+        let completable =
+            !busy && permission.is_none() && confirm.is_none() && config_wizard.is_none();
         refresh_completion(&input, input_cursor, cwd, completable, &mut completion);
         // 上下文占用警示:空闲时 >=90% 提示一次(可 /compact 或开新会话);回落后重新武装。
         // 窗口未知不提示(宁可不说,也不拿猜出来的窗口劝人做没必要的压缩);
@@ -1416,8 +1467,7 @@ fn match_session(sessions: &[PathBuf], target: &str) -> Option<PathBuf> {
         .iter()
         .find(|p| {
             p.to_string_lossy().contains(target)
-                || p
-                    .file_stem()
+                || p.file_stem()
                     .map(|s| s.to_string_lossy().contains(target))
                     .unwrap_or(false)
         })
@@ -1479,23 +1529,28 @@ fn handle_command(
                         Ok(snap) => {
                             items.push(MsgItem::Notice(format!(
                                 "已回滚 #{idx}: {} ← 快照 {}",
-                                snap.orig,
-                                snap.ts_ms
+                                snap.orig, snap.ts_ms
                             )));
                         }
                         Err(e) => items.push(MsgItem::CommandOutput(format!("回滚失败: {e}"))),
                     }
                 } else {
-                    items.push(MsgItem::CommandOutput("用法:/undo(列表) 或 /undo <序号>(回滚)".into()));
+                    items.push(MsgItem::CommandOutput(
+                        "用法:/undo(列表) 或 /undo <序号>(回滚)".into(),
+                    ));
                 }
                 return None;
             }
             let snaps = znaide_core::undo::list();
             if snaps.is_empty() {
-                items.push(MsgItem::CommandOutput("暂无 undo 快照(还没有文件被修改过)".into()));
+                items.push(MsgItem::CommandOutput(
+                    "暂无 undo 快照(还没有文件被修改过)".into(),
+                ));
                 return None;
             }
-            let mut out = String::from("undo 快照(最新在前,共 " .to_owned() + &snaps.len().to_string() + "):\n");
+            let mut out = String::from(
+                "undo 快照(最新在前,共 ".to_owned() + &snaps.len().to_string() + "):\n",
+            );
             for (i, s) in snaps.iter().take(20).enumerate() {
                 let t = s.ts_ms as f64 / 1000.0;
                 let ext = if s.is_external() { " ·外部" } else { "" };
@@ -1522,34 +1577,36 @@ fn handle_command(
             // 带参数:恢复 / 删除(兼容旧行为,脚本友好)
             let history = list_history_sessions_detailed();
             if history.is_empty() {
-                items.push(MsgItem::CommandOutput("暂无历史会话(~/.znaide/sessions/ 为空)".into()));
+                items.push(MsgItem::CommandOutput(
+                    "暂无历史会话(~/.znaide/sessions/ 为空)".into(),
+                ));
                 return None;
             }
             let paths: Vec<PathBuf> = history.iter().map(|h| h.path.clone()).collect();
             if parts[1] == "del" {
                 // /resume del <序号|片段> 删除历史
                 if parts.len() < 3 {
-                    items.push(MsgItem::CommandOutput("用法:/resume del <序号|文件名片段>".into()));
+                    items.push(MsgItem::CommandOutput(
+                        "用法:/resume del <序号|文件名片段>".into(),
+                    ));
                     return None;
                 }
                 let target = parts[2];
                 let matched = match_session(&paths, target);
                 match matched {
-                    Some(path) => {
-                        match remove_session(&path) {
-                            Ok(()) => {
-                                items.push(MsgItem::Notice(format!(
-                                    "🗑 已删除历史会话: {}",
-                                    path.display()
-                                )));
-                            }
-                            Err(e) => items.push(MsgItem::CommandOutput(format!(
-                                "删除失败: {e}"
-                            ))),
+                    Some(path) => match remove_session(&path) {
+                        Ok(()) => {
+                            items.push(MsgItem::Notice(format!(
+                                "🗑 已删除历史会话: {}",
+                                path.display()
+                            )));
                         }
-                    }
+                        Err(e) => items.push(MsgItem::CommandOutput(format!("删除失败: {e}"))),
+                    },
                     None => {
-                        items.push(MsgItem::CommandOutput(format!("未找到匹配「{target}」的历史会话")));
+                        items.push(MsgItem::CommandOutput(format!(
+                            "未找到匹配「{target}」的历史会话"
+                        )));
                     }
                 }
                 return None;
@@ -1563,7 +1620,9 @@ fn handle_command(
                     items.push(MsgItem::Notice("正在恢复历史会话…".into()));
                 }
                 None => {
-                    items.push(MsgItem::CommandOutput(format!("未找到匹配「{target}」的历史会话")));
+                    items.push(MsgItem::CommandOutput(format!(
+                        "未找到匹配「{target}」的历史会话"
+                    )));
                 }
             }
             return None;
@@ -1677,7 +1736,11 @@ fn skill_list_text(cwd: &Path) -> String {
     }
     let mut out = String::from("已安装技能(直接输入 /名字 触发;模型也可自主调用):\n");
     for s in &set.skills {
-        let flag = if s.disable_model_invocation { " [仅手动]" } else { "" };
+        let flag = if s.disable_model_invocation {
+            " [仅手动]"
+        } else {
+            ""
+        };
         out.push_str(&format!(
             "  /{} — {}({}){}\n",
             s.name,
@@ -1764,7 +1827,10 @@ fn push_history_item(
         }
         Role::Tool => {
             let content = msg.content.clone().unwrap_or_default();
-            let idx = msg.tool_call_id.as_deref().and_then(|id| pending.remove(id));
+            let idx = msg
+                .tool_call_id
+                .as_deref()
+                .and_then(|id| pending.remove(id));
             match idx {
                 Some(i) => {
                     if let Some(MsgItem::Tool { ok, output, .. }) = items.get_mut(i) {
@@ -1858,7 +1924,11 @@ fn handle_session_event(
             stats.last_prompt = Some(prompt); // 当前上下文占用 = 最近一次请求的 prompt
             stats.round_est = 0;
         }
-        SessionEvent::ToolStarted { name, args, idle_ms } => {
+        SessionEvent::ToolStarted {
+            name,
+            args,
+            idle_ms,
+        } => {
             items.push(MsgItem::Tool {
                 name,
                 args,
@@ -1919,8 +1989,19 @@ fn handle_session_event(
             // 状态栏人格显示跟随切换(空 = 关闭人格)
             *persona = name;
         }
-        SessionEvent::PermissionRequest { title, body, warning, tx, .. } => {
-            *permission = Some(PermissionPrompt { title, body, warning, tx });
+        SessionEvent::PermissionRequest {
+            title,
+            body,
+            warning,
+            tx,
+            ..
+        } => {
+            *permission = Some(PermissionPrompt {
+                title,
+                body,
+                warning,
+                tx,
+            });
         }
         SessionEvent::RoundsExhausted { .. } => {
             // 正常路径下由事件循环拦截并弹"继续执行"确认框(见 run 的事件泵);
@@ -2221,7 +2302,9 @@ fn tool_args_summary(name: &str, args: &str) -> String {
 
 /// 收纳推进条(压缩/归档类动作):整块向细条收拢再弹开,表达"正在收纳/压缩"
 fn shrink_char(frame: usize) -> char {
-    const S: [char; 14] = ['█', '▉', '▊', '▋', '▌', '▍', '▎', '▏', '▎', '▍', '▌', '▋', '▊', '▉'];
+    const S: [char; 14] = [
+        '█', '▉', '▊', '▋', '▌', '▍', '▎', '▏', '▎', '▍', '▌', '▋', '▊', '▉',
+    ];
     S[frame % S.len()]
 }
 
@@ -2263,11 +2346,17 @@ const SLASH_BUILTINS: &[(&str, &str)] = &[
     ("/skills", "已安装技能列表"),
     ("/config", "打开配置向导"),
     ("/undo", "undo 快照/回滚(/undo <序号>)"),
-    ("/resume", "历史会话管理窗口(批量删/备注/恢复); /resume <片段> 直接恢复"),
+    (
+        "/resume",
+        "历史会话管理窗口(批量删/备注/恢复); /resume <片段> 直接恢复",
+    ),
     ("/clear", "清空会话(确认后不可恢复)"),
     ("/compact", "压缩上下文:旧对话 → 摘要,释放空间"),
     ("/update", "检查并更新到 GitHub 最新版本"),
-    ("/persona", "人格设置:列表/切换(/persona <名字>, /persona 无 关闭)"),
+    (
+        "/persona",
+        "人格设置:列表/切换(/persona <名字>, /persona 无 关闭)",
+    ),
     ("/quit", "退出本次会话(显示统计);/exit 同效"),
 ];
 
@@ -2290,7 +2379,10 @@ fn completion_detect(input: &str, cursor: usize) -> Option<(CompletionKind, usiz
     }
     let is_sep = |c: char| {
         c.is_whitespace()
-            || matches!(c, ',' | '。' | ';' | '\n' | '\r' | '」' | ')' | ']' | '}' | '：' | ':')
+            || matches!(
+                c,
+                ',' | '。' | ';' | '\n' | '\r' | '」' | ')' | ']' | '}' | '：' | ':'
+            )
     };
     let mut word_start = line_base;
     for (i, c) in line.char_indices() {
@@ -2322,7 +2414,9 @@ fn prefix_ci(name: &str, typed: &str) -> bool {
     if t > n {
         return false;
     }
-    name.chars().zip(typed.chars()).all(|(a, b)| a.eq_ignore_ascii_case(&b))
+    name.chars()
+        .zip(typed.chars())
+        .all(|(a, b)| a.eq_ignore_ascii_case(&b))
 }
 
 /// slash 候选:内置命令 + 已安装技能(前缀过滤)
@@ -2342,7 +2436,11 @@ fn slash_candidates(cwd: &Path, typed: &str) -> Vec<CompletionItem> {
         if !prefix_ci(&s.name, typed) {
             continue;
         }
-        let flag = if s.disable_model_invocation { " [仅手动]" } else { "" };
+        let flag = if s.disable_model_invocation {
+            " [仅手动]"
+        } else {
+            ""
+        };
         let hint = format!("技能 · {}{}", s.description, flag);
         out.push(CompletionItem {
             label: format!("/{}", s.name),
@@ -2356,8 +2454,7 @@ fn slash_candidates(cwd: &Path, typed: &str) -> Vec<CompletionItem> {
 /// 名称含空白或引用边界字符时用 @"..." 形式(与 refs 引号解析一致)
 fn quote_at_path(name: &str) -> String {
     let needs = name.chars().any(|c| {
-        c.is_whitespace()
-            || matches!(c, ',' | '。' | ';' | '」' | ')' | ']' | '}' | '：' | ':')
+        c.is_whitespace() || matches!(c, ',' | '。' | ';' | '」' | ')' | ']' | '}' | '：' | ':')
     });
     if needs {
         format!("\"{name}\"")
@@ -2524,7 +2621,12 @@ fn draw_completion_menu(f: &mut ratatui::Frame<'_>, input_area: Rect, cm: &Compl
     let height = rows + 2; // + 边框上下
     let x = input_area.x + 1;
     let y = input_area.y.saturating_sub(height).max(1);
-    let menu = Rect { x, y, width, height };
+    let menu = Rect {
+        x,
+        y,
+        width,
+        height,
+    };
     f.render_widget(Clear, menu);
     let block = Block::default()
         .borders(ratatui::widgets::Borders::ALL)
@@ -2559,7 +2661,10 @@ fn draw_completion_menu(f: &mut ratatui::Frame<'_>, input_area: Rect, cm: &Compl
         if it.hint.is_empty() {
             spans.push(Span::styled(" ".repeat(pad), style));
         } else {
-            spans.push(Span::styled(format!("{}{}", " ".repeat(pad), truncate(&it.hint, hint_w)), style));
+            spans.push(Span::styled(
+                format!("{}{}", " ".repeat(pad), truncate(&it.hint, hint_w)),
+                style,
+            ));
         }
         ls.push(Line::from(spans));
     }
@@ -2685,9 +2790,13 @@ fn render_input(
     ghost: Option<&str>,
 ) -> Paragraph<'static> {
     let cursor = cursor.min(input.len());
-    let prompt_style = Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD);
-    let cursor_style =
-        Style::default().fg(Color::Black).bg(Color::Cyan).add_modifier(Modifier::BOLD);
+    let prompt_style = Style::default()
+        .fg(Color::Cyan)
+        .add_modifier(Modifier::BOLD);
+    let cursor_style = Style::default()
+        .fg(Color::Black)
+        .bg(Color::Cyan)
+        .add_modifier(Modifier::BOLD);
     let ghost_style = Style::default().fg(Color::DarkGray);
 
     // 前缀宽度(首行 "❯ …label ");后续物理行用等宽缩进保持对齐
@@ -2703,10 +2812,7 @@ fn render_input(
 
     // 先确定每行文本
     let all_lines: Vec<&str> = input.split('\n').collect();
-    let cursor_text = all_lines
-        .get(cursor_line)
-        .copied()
-        .unwrap_or_default();
+    let cursor_text = all_lines.get(cursor_line).copied().unwrap_or_default();
 
     // 精确定位光标:光标所在物理行与列
     // 先求光标行的物理分块(按 wrap_plain 逻辑与上面一致)
@@ -2765,7 +2871,11 @@ fn render_input(
         if pi < win_start || pi >= win_end {
             continue;
         }
-        let prefix = if *li == 0 { &prefix_first } else { &prefix_cont };
+        let prefix = if *li == 0 {
+            &prefix_first
+        } else {
+            &prefix_cont
+        };
         let mut spans: Vec<Span<'static>> = Vec::new();
         spans.push(Span::styled(prefix.clone(), prompt_style));
         if pi == cursor_phys_global {
@@ -2841,12 +2951,16 @@ fn build_content_lines(
                     if i == 0 {
                         spans.push(Span::styled(
                             "❯ 你: ",
-                            Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD),
+                            Style::default()
+                                .fg(Color::Cyan)
+                                .add_modifier(Modifier::BOLD),
                         ));
                     } else {
                         spans.push(Span::styled(
                             "      ",
-                            Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD),
+                            Style::default()
+                                .fg(Color::Cyan)
+                                .add_modifier(Modifier::BOLD),
                         ));
                     }
                     spans.extend(seg.spans.iter().cloned());
@@ -2873,7 +2987,9 @@ fn build_content_lines(
                 out.push(Line::from(""));
             }
             MsgItem::Reasoning(r) => {
-                let dim = Style::default().fg(Color::DarkGray).add_modifier(Modifier::ITALIC);
+                let dim = Style::default()
+                    .fg(Color::DarkGray)
+                    .add_modifier(Modifier::ITALIC);
                 let segs = crate::md::wrap_plain(r, width.saturating_sub(2));
                 for (i, seg) in segs.iter().enumerate() {
                     let prefix = if i == 0 { "… " } else { "" };
@@ -2881,7 +2997,17 @@ fn build_content_lines(
                 }
                 out.push(Line::from(""));
             }
-            MsgItem::Tool { name, args, ok, output, started, done_secs, idle_ms, silent, live } => {
+            MsgItem::Tool {
+                name,
+                args,
+                ok,
+                output,
+                started,
+                done_secs,
+                idle_ms,
+                silent,
+                live,
+            } => {
                 // 执行中:脉动光标;完成:✓ / ✗
                 let icon = match ok {
                     None => pulse_char(anim_frame / 2).to_string(),
@@ -2948,11 +3074,8 @@ fn build_content_lines(
                     // 屏幕行——保证"最新"在视野里
                     let base = Style::default().fg(Color::DarkGray);
                     let tail_src = last_n_lines(live, 40);
-                    let rendered = crate::ansi::render_lines(
-                        &tail_src,
-                        width.saturating_sub(8),
-                        base,
-                    );
+                    let rendered =
+                        crate::ansi::render_lines(&tail_src, width.saturating_sub(8), base);
                     let skip = rendered.len().saturating_sub(LIVE_ROWS);
                     for line in rendered.into_iter().skip(skip) {
                         let mut spans = vec![Span::raw("      ")];
@@ -2965,13 +3088,10 @@ fn build_content_lines(
                     // 工具/命令输出可能带 ANSI 颜色:解析成样式保留观感,
                     // 同时剥掉其余控制字节(否则真实 ESC 会被终端执行、污染整屏)
                     let base = Style::default().fg(Color::DarkGray);
-                    for (i, line) in crate::ansi::render_lines(
-                        &out_text,
-                        width.saturating_sub(8),
-                        base,
-                    )
-                    .into_iter()
-                    .enumerate()
+                    for (i, line) in
+                        crate::ansi::render_lines(&out_text, width.saturating_sub(8), base)
+                            .into_iter()
+                            .enumerate()
                     {
                         if i >= 4 {
                             break;
@@ -2984,7 +3104,10 @@ fn build_content_lines(
                 out.push(Line::from(""));
             }
             MsgItem::Notice(n) => {
-                for (i, line) in crate::md::wrap_plain(n, width.saturating_sub(2)).iter().enumerate() {
+                for (i, line) in crate::md::wrap_plain(n, width.saturating_sub(2))
+                    .iter()
+                    .enumerate()
+                {
                     let prefix = if i == 0 { "ℹ " } else { "   " };
                     out.push(Line::from(Span::styled(
                         format!("{prefix}{line}"),
@@ -3026,7 +3149,6 @@ fn build_content_lines(
     out
 }
 
-
 /// 消息区右侧滚动条:内容超过可视高度时,在右边框列上画一段拇指。
 /// scroll_back = 从底部算起的偏移行数(0 = 在底部)。thumb 高度按内容比例缩放。
 fn draw_msg_scrollbar(
@@ -3046,10 +3168,16 @@ fn draw_msg_scrollbar(
     let travel = area_h - thumb;
     let sb = scroll_back.min(range);
     // 拇指顶部在可视区内的行号:scroll_back=0(看最新)→ 贴底;=range(看最旧)→ 贴顶
-    let pos = if range > 0 { ((range - sb) * travel) / range } else { 0 };
+    let pos = if range > 0 {
+        ((range - sb) * travel) / range
+    } else {
+        0
+    };
 
     let col = area.right().saturating_sub(1); // 右边框列
-    let style = Style::default().fg(Color::DarkGray).add_modifier(Modifier::BOLD);
+    let style = Style::default()
+        .fg(Color::DarkGray)
+        .add_modifier(Modifier::BOLD);
     let buf = f.buffer_mut();
     for r in 0..area_h {
         let row = area.y + 1 + r as u16;
@@ -3150,7 +3278,14 @@ fn draw_permission(f: &mut ratatui::Frame<'_>, area: Rect, pp: &PermissionPrompt
         // 高危/无法判定:红色弹窗,把解析出的目标/原因一并显示,只给单次放行
         Some(w) => {
             let body = format!("{}\n\n{w}", pp.body);
-            draw_confirm_popup(f, area, &pp.title, &body, "y 允许一次 | n 拒绝 | Esc 取消", true);
+            draw_confirm_popup(
+                f,
+                area,
+                &pp.title,
+                &body,
+                "y 允许一次 | n 拒绝 | Esc 取消",
+                true,
+            );
         }
         None => draw_confirm_popup(
             f,
@@ -3178,10 +3313,19 @@ fn draw_confirm_popup(
     let color = if danger { Color::Red } else { Color::Yellow };
     let x = area.x + (area.width.saturating_sub(popup_w)) / 2;
     let y = area.y + (area.height.saturating_sub(popup_h)) / 2;
-    let popup = Rect { x, y, width: popup_w, height: popup_h };
+    let popup = Rect {
+        x,
+        y,
+        width: popup_w,
+        height: popup_h,
+    };
     f.render_widget(Clear, popup);
     let block = Block::default()
-        .title(if danger { " 高危命令确认 " } else { " 操作确认 " })
+        .title(if danger {
+            " 高危命令确认 "
+        } else {
+            " 操作确认 "
+        })
         .borders(ratatui::widgets::Borders::ALL)
         .border_type(BorderType::Rounded)
         .border_style(Style::default().fg(color));
@@ -3196,7 +3340,10 @@ fn draw_confirm_popup(
         Line::from(""),
         Line::from(Span::raw(body)),
         Line::from(""),
-        Line::from(Span::styled(format!("  {hint}"), Style::default().fg(Color::Cyan))),
+        Line::from(Span::styled(
+            format!("  {hint}"),
+            Style::default().fg(Color::Cyan),
+        )),
     ];
     f.render_widget(Paragraph::new(lines).alignment(Alignment::Left), inner);
 }
@@ -3334,7 +3481,9 @@ mod key_tests {
     fn paste_then_backspace_deletes() {
         let mut input = String::new();
         // 模拟 Event::Paste 分支的规范化
-        let pasted = "line one\r\nline two\n".replace("\r\n", "\n").replace('\r', "\n");
+        let pasted = "line one\r\nline two\n"
+            .replace("\r\n", "\n")
+            .replace('\r', "\n");
         let mut cur = insert_str_at(&mut input, 0, &pasted);
         assert_eq!(input, "line one\nline two\n");
         assert_eq!(cur, input.len());
@@ -3371,7 +3520,10 @@ mod key_tests {
     fn cursor_moves() {
         let input = String::from("aé中"); // 含多字节
         assert_eq!(cursor_next(&input, 0), 'a'.len_utf8());
-        assert_eq!(cursor_prev(&input, input.len()), input.len() - '中'.len_utf8());
+        assert_eq!(
+            cursor_prev(&input, input.len()),
+            input.len() - '中'.len_utf8()
+        );
     }
 
     #[test]
@@ -3382,7 +3534,12 @@ mod key_tests {
         assert_eq!(next_mode(Mode::BypassPermissions), Mode::Yolo);
         assert_eq!(next_mode(Mode::Yolo), Mode::Ask);
         // 四档都有可读描述(状态栏/提示用)
-        for m in [Mode::Ask, Mode::AcceptEdits, Mode::BypassPermissions, Mode::Yolo] {
+        for m in [
+            Mode::Ask,
+            Mode::AcceptEdits,
+            Mode::BypassPermissions,
+            Mode::Yolo,
+        ] {
             assert!(!m.hint().is_empty());
             assert!(!m.label().is_empty());
         }
@@ -3441,30 +3598,99 @@ mod token_tests {
         let mut persona = String::new();
         let mut st = TokenStats::default();
 
-        handle_session_event(SessionEvent::TurnStarted, &mut items, &mut busy, &mut kind, &mut perm, &mut sid, &mut persona, &mut st);
+        handle_session_event(
+            SessionEvent::TurnStarted,
+            &mut items,
+            &mut busy,
+            &mut kind,
+            &mut perm,
+            &mut sid,
+            &mut persona,
+            &mut st,
+        );
         assert!(busy);
         assert_eq!(kind, BusyKind::Work);
-        handle_session_event(SessionEvent::TextDelta("你好".into()), &mut items, &mut busy, &mut kind, &mut perm, &mut sid, &mut persona, &mut st); // 2 字 → 估 2
+        handle_session_event(
+            SessionEvent::TextDelta("你好".into()),
+            &mut items,
+            &mut busy,
+            &mut kind,
+            &mut perm,
+            &mut sid,
+            &mut persona,
+            &mut st,
+        ); // 2 字 → 估 2
         assert_eq!(st.round_est, 2);
         // 该轮真实用量到账 → 输入/输出分别累计,估算清零
         handle_session_event(
-            SessionEvent::Usage { prompt: 100, completion: 40 },
-            &mut items, &mut busy, &mut kind, &mut perm, &mut sid, &mut persona, &mut st,
+            SessionEvent::Usage {
+                prompt: 100,
+                completion: 40,
+            },
+            &mut items,
+            &mut busy,
+            &mut kind,
+            &mut perm,
+            &mut sid,
+            &mut persona,
+            &mut st,
         );
         assert_eq!(st.input, 100);
         assert_eq!(st.output, 40);
         assert_eq!(st.last_prompt, Some(100)); // 当前上下文占用 = 最近一次 prompt
         assert_eq!(st.round_est, 0);
-        handle_session_event(SessionEvent::TurnFinished { text: String::new(), truncated: false }, &mut items, &mut busy, &mut kind, &mut perm, &mut sid, &mut persona, &mut st);
+        handle_session_event(
+            SessionEvent::TurnFinished {
+                text: String::new(),
+                truncated: false,
+            },
+            &mut items,
+            &mut busy,
+            &mut kind,
+            &mut perm,
+            &mut sid,
+            &mut persona,
+            &mut st,
+        );
         assert!(!busy);
         assert_eq!(kind, BusyKind::Work);
 
         // 跨回合:累计保留;新回合从 0 起估
-        handle_session_event(SessionEvent::TurnStarted, &mut items, &mut busy, &mut kind, &mut perm, &mut sid, &mut persona, &mut st);
-        handle_session_event(SessionEvent::TextDelta("hello world".into()), &mut items, &mut busy, &mut kind, &mut perm, &mut sid, &mut persona, &mut st); // 11 ASCII → 估 3
+        handle_session_event(
+            SessionEvent::TurnStarted,
+            &mut items,
+            &mut busy,
+            &mut kind,
+            &mut perm,
+            &mut sid,
+            &mut persona,
+            &mut st,
+        );
+        handle_session_event(
+            SessionEvent::TextDelta("hello world".into()),
+            &mut items,
+            &mut busy,
+            &mut kind,
+            &mut perm,
+            &mut sid,
+            &mut persona,
+            &mut st,
+        ); // 11 ASCII → 估 3
         assert_eq!(st.round_est, 3);
         // 端点无 usage:回合结束丢弃未结算估算,累计不变
-        handle_session_event(SessionEvent::TurnFinished { text: String::new(), truncated: false }, &mut items, &mut busy, &mut kind, &mut perm, &mut sid, &mut persona, &mut st);
+        handle_session_event(
+            SessionEvent::TurnFinished {
+                text: String::new(),
+                truncated: false,
+            },
+            &mut items,
+            &mut busy,
+            &mut kind,
+            &mut perm,
+            &mut sid,
+            &mut persona,
+            &mut st,
+        );
         assert_eq!(st.round_est, 0);
         assert_eq!(st.input, 100);
         assert_eq!(st.output, 40);
@@ -3490,19 +3716,24 @@ mod token_tests {
         let mut persona = String::new();
         let mut st = TokenStats::default();
         let fire = |e: SessionEvent,
-                        items: &mut Vec<MsgItem>,
-                        busy: &mut bool,
-                        kind: &mut BusyKind,
-                        perm: &mut Option<PermissionPrompt>,
-                        sid: &mut String,
-                        persona: &mut String,
-                        st: &mut TokenStats| {
+                    items: &mut Vec<MsgItem>,
+                    busy: &mut bool,
+                    kind: &mut BusyKind,
+                    perm: &mut Option<PermissionPrompt>,
+                    sid: &mut String,
+                    persona: &mut String,
+                    st: &mut TokenStats| {
             handle_session_event(e, items, busy, kind, perm, sid, persona, st);
         };
         let tool = |items: &Vec<MsgItem>| match &items[0] {
-            MsgItem::Tool { name, ok, started, idle_ms, silent, .. } => {
-                (name.clone(), *ok, started.is_some(), *idle_ms, *silent)
-            }
+            MsgItem::Tool {
+                name,
+                ok,
+                started,
+                idle_ms,
+                silent,
+                ..
+            } => (name.clone(), *ok, started.is_some(), *idle_ms, *silent),
             _ => panic!("应是 Tool 卡片"),
         };
 
@@ -3512,24 +3743,60 @@ mod token_tests {
                 args: String::new(),
                 idle_ms: Some(90_000),
             },
-            &mut items, &mut busy, &mut kind, &mut perm, &mut sid, &mut persona, &mut st,
+            &mut items,
+            &mut busy,
+            &mut kind,
+            &mut perm,
+            &mut sid,
+            &mut persona,
+            &mut st,
         );
-        assert_eq!(tool(&items), ("run_shell_command".into(), None, true, Some(90_000), 0));
+        assert_eq!(
+            tool(&items),
+            ("run_shell_command".into(), None, true, Some(90_000), 0)
+        );
 
         // 静默预警:黄 → 红 → 解除
         fire(
-            SessionEvent::ToolSilentAlert { name: "run_shell_command".into(), level: 1 },
-            &mut items, &mut busy, &mut kind, &mut perm, &mut sid, &mut persona, &mut st,
+            SessionEvent::ToolSilentAlert {
+                name: "run_shell_command".into(),
+                level: 1,
+            },
+            &mut items,
+            &mut busy,
+            &mut kind,
+            &mut perm,
+            &mut sid,
+            &mut persona,
+            &mut st,
         );
         assert_eq!(tool(&items).4, 1);
         fire(
-            SessionEvent::ToolSilentAlert { name: "run_shell_command".into(), level: 2 },
-            &mut items, &mut busy, &mut kind, &mut perm, &mut sid, &mut persona, &mut st,
+            SessionEvent::ToolSilentAlert {
+                name: "run_shell_command".into(),
+                level: 2,
+            },
+            &mut items,
+            &mut busy,
+            &mut kind,
+            &mut perm,
+            &mut sid,
+            &mut persona,
+            &mut st,
         );
         assert_eq!(tool(&items).4, 2);
         fire(
-            SessionEvent::ToolSilentAlert { name: "run_shell_command".into(), level: 0 },
-            &mut items, &mut busy, &mut kind, &mut perm, &mut sid, &mut persona, &mut st,
+            SessionEvent::ToolSilentAlert {
+                name: "run_shell_command".into(),
+                level: 0,
+            },
+            &mut items,
+            &mut busy,
+            &mut kind,
+            &mut perm,
+            &mut sid,
+            &mut persona,
+            &mut st,
         );
         assert_eq!(tool(&items).4, 0);
 
@@ -3540,18 +3807,49 @@ mod token_tests {
                 ok: true,
                 output: "done".into(),
             },
-            &mut items, &mut busy, &mut kind, &mut perm, &mut sid, &mut persona, &mut st,
+            &mut items,
+            &mut busy,
+            &mut kind,
+            &mut perm,
+            &mut sid,
+            &mut persona,
+            &mut st,
         );
-        assert_eq!(tool(&items), ("run_shell_command".into(), Some(true), true, Some(90_000), 0));
+        assert_eq!(
+            tool(&items),
+            (
+                "run_shell_command".into(),
+                Some(true),
+                true,
+                Some(90_000),
+                0
+            )
+        );
         // 完成后总用时已定格:不再随帧跳动
         assert!(
-            matches!(&items[0], MsgItem::Tool { ok: Some(true), done_secs: Some(_), .. }),
+            matches!(
+                &items[0],
+                MsgItem::Tool {
+                    ok: Some(true),
+                    done_secs: Some(_),
+                    ..
+                }
+            ),
             "完成后应定格总用时"
         );
         // 预警只作用于执行中卡片:完成后收到预警不应改已完成卡片
         fire(
-            SessionEvent::ToolSilentAlert { name: "run_shell_command".into(), level: 1 },
-            &mut items, &mut busy, &mut kind, &mut perm, &mut sid, &mut persona, &mut st,
+            SessionEvent::ToolSilentAlert {
+                name: "run_shell_command".into(),
+                level: 1,
+            },
+            &mut items,
+            &mut busy,
+            &mut kind,
+            &mut perm,
+            &mut sid,
+            &mut persona,
+            &mut st,
         );
         assert_eq!(tool(&items).4, 0);
     }
@@ -3603,7 +3901,14 @@ mod token_tests {
         let tool = ChatMessage::tool("c1", "(命令退出码 0)");
         push_history_item(&mut items, &tool, &mut names, &mut pending);
         // 结果回填进同一张卡片,不新增
-        if let MsgItem::Tool { name, args, ok: Some(true), output, .. } = &items[0] {
+        if let MsgItem::Tool {
+            name,
+            args,
+            ok: Some(true),
+            output,
+            ..
+        } = &items[0]
+        {
             assert_eq!(name, "run_shell_command");
             assert_eq!(args, r#"{"command":"ls -la"}"#);
             assert_eq!(output, "(命令退出码 0)");
@@ -3624,26 +3929,54 @@ mod token_tests {
         let mut persona = String::new();
         let mut st = TokenStats::default();
         let fire = |e: SessionEvent,
-                        items: &mut Vec<MsgItem>,
-                        busy: &mut bool,
-                        kind: &mut BusyKind,
-                        perm: &mut Option<PermissionPrompt>,
-                        sid: &mut String,
-                        persona: &mut String,
-                        st: &mut TokenStats| {
+                    items: &mut Vec<MsgItem>,
+                    busy: &mut bool,
+                    kind: &mut BusyKind,
+                    perm: &mut Option<PermissionPrompt>,
+                    sid: &mut String,
+                    persona: &mut String,
+                    st: &mut TokenStats| {
             handle_session_event(e, items, busy, kind, perm, sid, persona, st);
         };
         fire(
-            SessionEvent::ToolStarted { name: "run_shell_command".into(), args: "{}".into(), idle_ms: None },
-            &mut items, &mut busy, &mut kind, &mut perm, &mut sid, &mut persona, &mut st,
+            SessionEvent::ToolStarted {
+                name: "run_shell_command".into(),
+                args: "{}".into(),
+                idle_ms: None,
+            },
+            &mut items,
+            &mut busy,
+            &mut kind,
+            &mut perm,
+            &mut sid,
+            &mut persona,
+            &mut st,
         );
         fire(
-            SessionEvent::ToolOutputDelta { name: "run_shell_command".into(), delta: "line1\n".into() },
-            &mut items, &mut busy, &mut kind, &mut perm, &mut sid, &mut persona, &mut st,
+            SessionEvent::ToolOutputDelta {
+                name: "run_shell_command".into(),
+                delta: "line1\n".into(),
+            },
+            &mut items,
+            &mut busy,
+            &mut kind,
+            &mut perm,
+            &mut sid,
+            &mut persona,
+            &mut st,
         );
         fire(
-            SessionEvent::ToolOutputDelta { name: "run_shell_command".into(), delta: "line2\n".into() },
-            &mut items, &mut busy, &mut kind, &mut perm, &mut sid, &mut persona, &mut st,
+            SessionEvent::ToolOutputDelta {
+                name: "run_shell_command".into(),
+                delta: "line2\n".into(),
+            },
+            &mut items,
+            &mut busy,
+            &mut kind,
+            &mut perm,
+            &mut sid,
+            &mut persona,
+            &mut st,
         );
         if let MsgItem::Tool { ok: None, live, .. } = &items[0] {
             assert_eq!(live, "line1\nline2\n");
@@ -3652,14 +3985,38 @@ mod token_tests {
         }
         // 找不到执行中卡片(如历史里的旧命令)的 delta 应被忽略
         fire(
-            SessionEvent::ToolFinished { name: "run_shell_command".into(), ok: true, output: "done".into() },
-            &mut items, &mut busy, &mut kind, &mut perm, &mut sid, &mut persona, &mut st,
+            SessionEvent::ToolFinished {
+                name: "run_shell_command".into(),
+                ok: true,
+                output: "done".into(),
+            },
+            &mut items,
+            &mut busy,
+            &mut kind,
+            &mut perm,
+            &mut sid,
+            &mut persona,
+            &mut st,
         );
         fire(
-            SessionEvent::ToolOutputDelta { name: "run_shell_command".into(), delta: "late\n".into() },
-            &mut items, &mut busy, &mut kind, &mut perm, &mut sid, &mut persona, &mut st,
+            SessionEvent::ToolOutputDelta {
+                name: "run_shell_command".into(),
+                delta: "late\n".into(),
+            },
+            &mut items,
+            &mut busy,
+            &mut kind,
+            &mut perm,
+            &mut sid,
+            &mut persona,
+            &mut st,
         );
-        if let MsgItem::Tool { ok: Some(true), live, .. } = &items[0] {
+        if let MsgItem::Tool {
+            ok: Some(true),
+            live,
+            ..
+        } = &items[0]
+        {
             assert!(live.is_empty(), "完成后实时区应清空回落");
         } else {
             panic!("应已完成");
@@ -3736,13 +4093,29 @@ mod token_tests {
         let mut persona = String::new();
         let mut st = TokenStats::default();
         handle_session_event(
-            SessionEvent::PersonaChanged { name: "毒舌损友".into() },
-            &mut items, &mut busy, &mut kind, &mut perm, &mut sid, &mut persona, &mut st,
+            SessionEvent::PersonaChanged {
+                name: "毒舌损友".into(),
+            },
+            &mut items,
+            &mut busy,
+            &mut kind,
+            &mut perm,
+            &mut sid,
+            &mut persona,
+            &mut st,
         );
         assert_eq!(persona, "毒舌损友");
         handle_session_event(
-            SessionEvent::PersonaChanged { name: String::new() },
-            &mut items, &mut busy, &mut kind, &mut perm, &mut sid, &mut persona, &mut st,
+            SessionEvent::PersonaChanged {
+                name: String::new(),
+            },
+            &mut items,
+            &mut busy,
+            &mut kind,
+            &mut perm,
+            &mut sid,
+            &mut persona,
+            &mut st,
         );
         assert!(persona.is_empty(), "关闭人格应清空状态栏显示");
     }
@@ -3761,7 +4134,12 @@ mod slash_tests {
         let mut confirm: Option<ConfirmBox> = None;
         let cwd = std::env::temp_dir();
         let r = handle_command(
-            "/clear", &cmd_tx, &update_tx, &mut items, &cwd, &mut confirm,
+            "/clear",
+            &cmd_tx,
+            &update_tx,
+            &mut items,
+            &cwd,
+            &mut confirm,
         );
         assert!(r.is_none());
         // 展示未被直接清空,而是挂起一个确认
@@ -3858,7 +4236,7 @@ mod completion_tests {
         assert!(labels.contains(&"src/"));
         assert!(labels.contains(&"README.md"));
         assert!(!labels.contains(&".hidden")); // 隐藏默认不列
-        // 含空格文件:label 裸名,insert 带引号
+                                               // 含空格文件:label 裸名,insert 带引号
         let spaced = items.iter().find(|i| i.label == "my file.txt").unwrap();
         assert_eq!(spaced.insert, "\"my file.txt\"");
 
@@ -3883,7 +4261,9 @@ mod completion_tests {
         let items = slash_candidates(&cwd, "un");
         assert!(items.iter().any(|i| i.label == "/undo"));
         let items = slash_candidates(&cwd, "re");
-        assert!(items.iter().any(|i| i.label == "/resume" && i.hint.contains("历史会话")));
+        assert!(items
+            .iter()
+            .any(|i| i.label == "/resume" && i.hint.contains("历史会话")));
         // typed="" 列出全部内置
         let all = slash_candidates(&cwd, "");
         assert!(all.len() >= 7);
@@ -4010,9 +4390,15 @@ mod completion_tests {
             selected: 0,
         };
         // slash:typed 不含 '/',ghost 补 label 剩余
-        assert_eq!(ghost_tail(&mk(CompletionKind::Slash, "he", "/help")).as_deref(), Some("lp"));
+        assert_eq!(
+            ghost_tail(&mk(CompletionKind::Slash, "he", "/help")).as_deref(),
+            Some("lp")
+        );
         // 已完全输入 → 无 ghost
-        assert_eq!(ghost_tail(&mk(CompletionKind::Slash, "help", "/help")), None);
+        assert_eq!(
+            ghost_tail(&mk(CompletionKind::Slash, "help", "/help")),
+            None
+        );
         // @ 补全目录尾巴(label 带目录前缀)
         assert_eq!(
             ghost_tail(&mk(CompletionKind::At, "src/ma", "src/main.rs")).as_deref(),
@@ -4268,9 +4654,18 @@ mod input_queue_tests {
     fn queued_notice_previews_on_one_line() {
         let q = InputQueue::default();
         let notice = q.push("第一行\n第二行\n第三行");
-        assert!(notice.contains("第一行 第二行"), "多行预览要压成一行: {notice}");
-        assert!(!notice.contains('\n'), "提示本身不能是消息区里的多行: {notice}");
-        assert!(notice.contains("轮边界"), "要说清发出时机是轮边界: {notice}");
+        assert!(
+            notice.contains("第一行 第二行"),
+            "多行预览要压成一行: {notice}"
+        );
+        assert!(
+            !notice.contains('\n'),
+            "提示本身不能是消息区里的多行: {notice}"
+        );
+        assert!(
+            notice.contains("轮边界"),
+            "要说清发出时机是轮边界: {notice}"
+        );
         let long = q.push(&"很长的一段话".repeat(20));
         assert!(long.ends_with('…'), "超长要带省略号: {long}");
         assert!(long.chars().count() < 80, "预览不该把整段贴回来: {long}");
@@ -4286,10 +4681,16 @@ mod input_queue_tests {
         let _ = q.push("第二条");
         assert_eq!(q.len(), 2);
         // 模拟 core 的轮边界取走一条(它拿的是同一个投递箱)
-        assert_eq!(shared.lock().unwrap().pop_front().as_deref(), Some("第一条"));
+        assert_eq!(
+            shared.lock().unwrap().pop_front().as_deref(),
+            Some("第一条")
+        );
         assert_eq!(q.len(), 1, "界面计数必须跟着引擎走,不能各记一份");
         assert!(!q.is_empty());
-        assert_eq!(shared.lock().unwrap().pop_front().as_deref(), Some("第二条"));
+        assert_eq!(
+            shared.lock().unwrap().pop_front().as_deref(),
+            Some("第二条")
+        );
         assert!(q.is_empty(), "最后一条也被插走后,界面不该再显示队列");
     }
 }

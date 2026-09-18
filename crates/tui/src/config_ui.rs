@@ -1,4 +1,4 @@
-//! 配置向导状态机(服务商 → 模型 → Key → 上下文窗口 → 轮数上限 → 验证)。
+//! 配置向导状态机(服务商 → 模型 → 协议 → Key → 上下文窗口 → 轮数上限 → 验证)。
 //! 与 app.rs 解耦:on_key 返回 WizardAction,宿主执行异步动作(查询模型/验证),
 //! 再把结果经 inject_models / inject_verify 回填。
 use crossterm::event::{KeyCode, KeyEvent};
@@ -7,6 +7,7 @@ use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Clear, Paragraph};
 use znaide_core::config::Config;
+use znaide_core::config::ProtocolKind;
 use znaide_core::config::ProviderDef;
 use znaide_core::config::Resolved;
 
@@ -15,10 +16,14 @@ use znaide_core::config::Resolved;
 pub enum Step {
     /// 选择服务商(列表)
     Provider,
+    /// 是否为该服务商启用稳定会话头(x-opencode-session，同一会话内稳定，用于服务端缓存)
+    SessionHeader,
     /// 正在查询模型(等待宿主回调)
     Querying,
     /// 模型列表(可上下选,或手动输入)
     ModelSelect,
+    /// 协议类型(chat/response,默认 chat)
+    ProtocolSelect,
     /// 输入 API Key
     ApiKey,
     /// 上下文窗口 token 数(状态栏 ctx 占用条的分母;留空 = 按模型名自动识别)
@@ -36,8 +41,13 @@ const MODEL_WINDOW: usize = 25;
 /// 宿主需要执行的异步动作
 pub enum WizardAction {
     None,
-    /// 查询模型列表(参数:base_url + api_key,由宿主调用 OpenAiClient)
-    FetchModels { base_url: String, api_key: Option<String> },
+    /// 查询模型列表(参数:base_url + api_key + 会话头探针值,由宿主调用 OpenAiClient)。
+    /// 开关关 → session_header 为 None(不发头)。
+    FetchModels {
+        base_url: String,
+        api_key: Option<String>,
+        session_header: Option<String>,
+    },
     /// 验证连接(base_url/model/api_key,由宿主调用 client.validate)
     Verify(Resolved),
     /// 退出向导
@@ -73,6 +83,15 @@ pub struct SetupWizard {
     /// 保存时写进当前 provider 条目;模型不在内置表里时就靠这里填准(否则 ctx 条
     /// 只报绝对量、不给百分比)。
     pub context_window: Option<usize>,
+    /// 协议类型(默认 chat)。由 `prefill()` 带出、保存时写进当前 provider 条目。
+    pub protocol: ProtocolKind,
+    /// 协议选择游标(0=chat, 1=response)
+    pub protocol_cursor: usize,
+    /// 是否为当前服务商启用稳定会话头(默认关)。由 `prefill()`/切服务商时按家带出、
+    /// 保存时写进当前 provider 条目;同一会话内所有模型请求携带同一稳定值(会话 ID)。
+    pub session_header: bool,
+    /// 会话头选择游标(0=是, 1=否，默认 1=否)
+    pub session_cursor: usize,
     /// 当前 typing 输入的是 max_turns(与模型名/key/端点共用输入通道,靠它区分)
     pub typing_max_turns: bool,
     /// 当前 typing 输入的是 context_window
@@ -103,6 +122,10 @@ impl SetupWizard {
             progress: String::new(),
             max_turns: None,
             context_window: None,
+            protocol: ProtocolKind::default(),
+            protocol_cursor: 0,
+            session_header: false,
+            session_cursor: 1,
             typing_max_turns: false,
             typing_context_window: false,
             key_from_env: false,
@@ -146,6 +169,15 @@ impl SetupWizard {
         self.models.clear();
         // 窗口也是"这家自己的":切换时不能沿用上一家的(40k 的 ollama 与 1M 的云端来回切会算错)
         self.context_window = def.as_ref().and_then(|d| d.context_window);
+        // 协议同样跟服务商走(避免沿用上一家的协议)
+        self.protocol = def.as_ref().and_then(|d| d.protocol).unwrap_or_default();
+        self.protocol_cursor = match self.protocol {
+            ProtocolKind::Chat => 0,
+            ProtocolKind::Response => 1,
+        };
+        // 会话头开关同样跟服务商走:换家即换开关,不沿用上一家
+        self.session_header = def.as_ref().map(|d| d.session_header).unwrap_or(false);
+        self.session_cursor = if self.session_header { 0 } else { 1 };
     }
 
     /// 用现有配置预填(重开 `/config` 时把已经配好的值显示出来)。
@@ -159,7 +191,7 @@ impl SetupWizard {
     /// 预填的纯逻辑(便于测试):服务商/模型/端点/Key/轮数上限全部带出,
     /// 游标落在当前服务商上,并在顶部显示"当前配置"摘要。
     pub fn apply_config(&mut self, cfg: &Config) {
-        let r = cfg.resolve(None, None, None, None).ok();
+        let r = cfg.resolve(None, None, None, None, None, None).ok();
         // 服务商:config 的 provider,兜底解析出的名字
         let provider = cfg
             .provider
@@ -187,14 +219,32 @@ impl SetupWizard {
             .as_ref()
             .and_then(|d| d.api_key.clone())
             .filter(|k| !k.is_empty());
-        self.api_key = top_plain.clone().or(entry_plain.clone()).unwrap_or_default();
+        self.api_key = top_plain
+            .clone()
+            .or(entry_plain.clone())
+            .unwrap_or_default();
         // 文件里没有明文、这家靠 api_key_env → 标记(界面提示,且保存时不写明文)
         self.key_from_env = top_plain.is_none()
             && entry_plain.is_none()
-            && def.as_ref().map(|d| d.api_key_env.is_some()).unwrap_or(false);
+            && def
+                .as_ref()
+                .map(|d| d.api_key_env.is_some())
+                .unwrap_or(false);
         self.max_turns = cfg.max_turns;
         // 窗口:当前 provider 条目里的固定值(没写 = None,界面显示"按模型名自动")
         self.context_window = def.as_ref().and_then(|d| d.context_window);
+        // 协议:顶层手动覆盖优先(与 model 的口径一致),否则条目值,否则 chat
+        self.protocol = cfg
+            .protocol
+            .or_else(|| def.as_ref().and_then(|d| d.protocol))
+            .unwrap_or_default();
+        self.protocol_cursor = match self.protocol {
+            ProtocolKind::Chat => 0,
+            ProtocolKind::Response => 1,
+        };
+        // 会话头:当前 provider 条目值(缺键 = 关)。顶层无该开关，不参与覆盖。
+        self.session_header = def.as_ref().map(|d| d.session_header).unwrap_or(false);
+        self.session_cursor = if self.session_header { 0 } else { 1 };
     }
 
     /// 是否已有配置可展示(首次运行全空 → 不显示摘要行)
@@ -247,7 +297,24 @@ impl SetupWizard {
             },
             // 面板里填的固定窗口(空 = 交给内置表/未知);验证不需要它,但保存要
             context_window: self.context_window,
+            protocol: self.protocol,
+            session_header_enabled: self.session_header,
         }
+    }
+
+    /// 进入会话头选择:光标落在当前值上(重开面板预填时落在已存值上)
+    fn enter_session_header(&mut self) {
+        self.session_cursor = if self.session_header { 0 } else { 1 };
+        self.step = Step::SessionHeader;
+    }
+
+    /// 进入协议选择:光标落在当前值上(重开面板预填时落在已存值上)
+    fn enter_protocol_select(&mut self) {
+        self.protocol_cursor = match self.protocol {
+            ProtocolKind::Chat => 0,
+            ProtocolKind::Response => 1,
+        };
+        self.step = Step::ProtocolSelect;
     }
 
     /// 宿主注入模型查询结果
@@ -296,7 +363,8 @@ impl SetupWizard {
         }
     }
 
-    /// 进入"正在查询模型"状态(宿主开始查询前调用)
+    /// 进入"正在查询模型"状态(宿主开始查询前调用)。
+    /// 开关开时带上一次性探针头值(验证阶段尚无正式 Session，仅走通缓存路由)。
     fn start_querying(&mut self, base_url: &str, api_key: Option<&str>) -> WizardAction {
         self.step = Step::Querying;
         self.progress = format!("正在查询 {base_url} 的模型列表…");
@@ -305,6 +373,11 @@ impl SetupWizard {
         WizardAction::FetchModels {
             base_url: base_url.to_string(),
             api_key: api_key.map(|s| s.to_string()),
+            session_header: if self.session_header {
+                Some(znaide_core::llm::openai::probe_session_value())
+            } else {
+                None
+            },
         }
     }
 
@@ -374,16 +447,68 @@ impl SetupWizard {
                         self.notice = "输入自定义端点(base_url),例如 http://localhost:11434/v1 或 https://api.example.com/v1:".into();
                         return WizardAction::None;
                     }
-                    let key = if self.api_key.is_empty() { None } else { Some(self.api_key.clone()) };
+                    // 选完供应商 → 先问是否启用会话头(确认后才查询模型，
+                    // 查询时即可按开关带探针头)。端点先记下，确认后再用。
+                    self.base_url = base;
+                    self.enter_session_header();
+                    WizardAction::None
+                }
+                _ => WizardAction::None,
+            },
+            Step::SessionHeader => match key.code {
+                KeyCode::Esc => {
+                    self.step = Step::Provider;
+                    WizardAction::None
+                }
+                KeyCode::Up | KeyCode::Char('k') => {
+                    self.session_cursor = self.session_cursor.saturating_sub(1);
+                    self.session_header = self.session_cursor == 0;
+                    WizardAction::None
+                }
+                KeyCode::Down | KeyCode::Char('j') => {
+                    self.session_cursor = (self.session_cursor + 1).min(1);
+                    self.session_header = self.session_cursor == 0;
+                    WizardAction::None
+                }
+                // Y/y 直达是，N/n 直达否
+                KeyCode::Char('y') | KeyCode::Char('Y') => {
+                    self.session_cursor = 0;
+                    self.session_header = true;
+                    let base = self.base_url.clone();
+                    let key = if self.api_key.is_empty() {
+                        None
+                    } else {
+                        Some(self.api_key.clone())
+                    };
+                    self.start_querying(&base, key.as_deref())
+                }
+                KeyCode::Char('n') | KeyCode::Char('N') => {
+                    self.session_cursor = 1;
+                    self.session_header = false;
+                    let base = self.base_url.clone();
+                    let key = if self.api_key.is_empty() {
+                        None
+                    } else {
+                        Some(self.api_key.clone())
+                    };
+                    self.start_querying(&base, key.as_deref())
+                }
+                KeyCode::Enter | KeyCode::Char('e') => {
+                    let base = self.base_url.clone();
+                    let key = if self.api_key.is_empty() {
+                        None
+                    } else {
+                        Some(self.api_key.clone())
+                    };
                     // 尝试模型自动查询;失败可手输
                     self.start_querying(&base, key.as_deref())
                 }
                 _ => WizardAction::None,
             },
             Step::Querying => {
-                // 等待宿主;按 Esc 放弃回到服务商
+                // 等待宿主;按 Esc 放弃回到会话头选择
                 if matches!(key.code, KeyCode::Esc) {
-                    self.step = Step::Provider;
+                    self.step = Step::SessionHeader;
                 }
                 WizardAction::None
             }
@@ -393,14 +518,16 @@ impl SetupWizard {
                     WizardAction::None
                 }
                 KeyCode::Down | KeyCode::Char('j') => {
-                    self.model_cursor = (self.model_cursor + 1).min(self.models.len().saturating_sub(1));
+                    self.model_cursor =
+                        (self.model_cursor + 1).min(self.models.len().saturating_sub(1));
                     WizardAction::None
                 }
                 KeyCode::Enter | KeyCode::Char('e') => {
                     if !self.models.is_empty() {
-                        self.model = self.models[self.model_cursor.min(self.models.len() - 1)].clone();
+                        self.model =
+                            self.models[self.model_cursor.min(self.models.len() - 1)].clone();
                     }
-                    self.step = Step::ApiKey;
+                    self.enter_protocol_select();
                     WizardAction::None
                 }
                 KeyCode::Char('m') | KeyCode::Char('M') => {
@@ -415,13 +542,36 @@ impl SetupWizard {
                 }
                 _ => WizardAction::None,
             },
+            Step::ProtocolSelect => match key.code {
+                KeyCode::Up | KeyCode::Char('k') => {
+                    self.protocol_cursor = self.protocol_cursor.saturating_sub(1);
+                    self.protocol =
+                        [ProtocolKind::Chat, ProtocolKind::Response][self.protocol_cursor.min(1)];
+                    WizardAction::None
+                }
+                KeyCode::Down | KeyCode::Char('j') => {
+                    self.protocol_cursor = (self.protocol_cursor + 1).min(1);
+                    self.protocol =
+                        [ProtocolKind::Chat, ProtocolKind::Response][self.protocol_cursor];
+                    WizardAction::None
+                }
+                KeyCode::Enter | KeyCode::Char('e') => {
+                    self.step = Step::ApiKey;
+                    WizardAction::None
+                }
+                KeyCode::Esc => {
+                    self.step = Step::ModelSelect;
+                    WizardAction::None
+                }
+                _ => WizardAction::None,
+            },
             Step::ApiKey => match key.code {
                 KeyCode::Esc => {
-                    // 回退:直接回模型选择(保留模型);若没有模型就回服务商
+                    // 回退:直接回协议选择(保留模型);若没有模型就回服务商
                     self.step = if self.models.is_empty() {
                         Step::Provider
                     } else {
-                        Step::ModelSelect
+                        Step::ProtocolSelect
                     };
                     WizardAction::None
                 }
@@ -451,14 +601,22 @@ impl SetupWizard {
                     self.typing_context_window = true;
                     self.input_buf.clear();
                     self.input_buf.push(c);
-                    self.notice = "输入当前模型的上下文窗口 token 数(留空 = 按模型名自动识别):".into();
+                    self.notice =
+                        "输入当前模型的上下文窗口 token 数(留空 = 按模型名自动识别):".into();
                     WizardAction::None
                 }
-                KeyCode::Char('t') | KeyCode::Char('T') | KeyCode::Char('e') | KeyCode::Char('E') => {
+                KeyCode::Char('t')
+                | KeyCode::Char('T')
+                | KeyCode::Char('e')
+                | KeyCode::Char('E') => {
                     self.typing = true;
                     self.typing_context_window = true;
-                    self.input_buf = self.context_window.map(|v| v.to_string()).unwrap_or_default();
-                    self.notice = "输入当前模型的上下文窗口 token 数(留空 = 按模型名自动识别):".into();
+                    self.input_buf = self
+                        .context_window
+                        .map(|v| v.to_string())
+                        .unwrap_or_default();
+                    self.notice =
+                        "输入当前模型的上下文窗口 token 数(留空 = 按模型名自动识别):".into();
                     WizardAction::None
                 }
                 KeyCode::Enter => {
@@ -485,14 +643,19 @@ impl SetupWizard {
                     self.typing_max_turns = true;
                     self.input_buf.clear();
                     self.input_buf.push(c);
-                    self.notice = "输入单条消息最多允许的模型往返轮数(0 = 不限,留空 = 默认):".into();
+                    self.notice =
+                        "输入单条消息最多允许的模型往返轮数(0 = 不限,留空 = 默认):".into();
                     WizardAction::None
                 }
-                KeyCode::Char('t') | KeyCode::Char('T') | KeyCode::Char('e') | KeyCode::Char('E') => {
+                KeyCode::Char('t')
+                | KeyCode::Char('T')
+                | KeyCode::Char('e')
+                | KeyCode::Char('E') => {
                     self.typing = true;
                     self.typing_max_turns = true;
                     self.input_buf = self.max_turns.map(|v| v.to_string()).unwrap_or_default();
-                    self.notice = "输入单条消息最多允许的模型往返轮数(0 = 不限,留空 = 默认):".into();
+                    self.notice =
+                        "输入单条消息最多允许的模型往返轮数(0 = 不限,留空 = 默认):".into();
                     WizardAction::None
                 }
                 KeyCode::Enter | KeyCode::Char('s') | KeyCode::Char('S') => {
@@ -578,15 +741,18 @@ impl SetupWizard {
             };
         }
         match self.step {
-            // 自定义服务商:提交的是端点,随后查询模型
+            // 自定义服务商:提交的是端点,先问会话头,确认后才查询模型
             Step::Provider if self.provider == "custom" => {
                 if v.is_empty() || !(v.starts_with("http://") || v.starts_with("https://")) {
                     self.notice = "端点要以 http:// 或 https:// 开头,重新输入:".into();
                     self.typing = true;
                     return WizardAction::None;
                 }
-                let key = if self.api_key.is_empty() { None } else { Some(self.api_key.clone()) };
-                self.start_querying(v, key.as_deref())
+                self.base_url = v.to_string();
+                // custom 无预设开关:默认关(沿用 new() 初值，不从别家带过来)
+                self.session_header = false;
+                self.enter_session_header();
+                WizardAction::None
             }
             // 手动输入模型(查询失败或按 m)
             Step::ModelSelect => {
@@ -596,7 +762,7 @@ impl SetupWizard {
                     return WizardAction::None;
                 }
                 self.model = v.to_string();
-                self.step = Step::ApiKey;
+                self.enter_protocol_select();
                 WizardAction::None
             }
             // 编辑 key(从 ApiKey 进入输入后,仍在 ApiKey 状态,typing 模式)
@@ -626,24 +792,30 @@ impl SetupWizard {
         // 步骤条
         let steps = [
             "1 服务商",
-            "2 模型",
-            "3 API Key",
-            "4 上下文窗口",
-            "5 轮数上限",
-            "6 验证",
+            "2 会话头",
+            "3 模型",
+            "4 协议",
+            "5 API Key",
+            "6 上下文窗口",
+            "7 轮数上限",
+            "8 验证",
         ];
         let current = match self.step {
             Step::Provider => 0,
-            Step::Querying | Step::ModelSelect => 1,
-            Step::ApiKey => 2,
-            Step::ContextWindow => 3,
-            Step::MaxTurns => 4,
-            Step::Verifying => 5,
+            Step::SessionHeader => 1,
+            Step::Querying | Step::ModelSelect => 2,
+            Step::ProtocolSelect => 3,
+            Step::ApiKey => 4,
+            Step::ContextWindow => 5,
+            Step::MaxTurns => 6,
+            Step::Verifying => 7,
         };
         let mut bar: Vec<Span> = Vec::new();
         for (i, s) in steps.iter().enumerate() {
             let st = if i == current {
-                Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)
+                Style::default()
+                    .fg(Color::Cyan)
+                    .add_modifier(Modifier::BOLD)
             } else if i < current {
                 Style::default().fg(Color::Green)
             } else {
@@ -670,15 +842,18 @@ impl SetupWizard {
                 Span::styled("当前配置: ", Style::default().fg(Color::DarkGray)),
                 Span::styled(
                     format!("{} / {}", self.provider, self.model),
-                    Style::default().fg(Color::Green).add_modifier(Modifier::BOLD),
+                    Style::default()
+                        .fg(Color::Green)
+                        .add_modifier(Modifier::BOLD),
                 ),
                 Span::styled(
                     format!(
-                        "  端点 {}  Key {}  窗口 {}  轮数 {}",
+                        "  端点 {}  Key {}  窗口 {}  轮数 {}  会话头 {}",
                         self.base_url,
                         key,
                         self.context_window_label(),
-                        self.max_turns_label()
+                        self.max_turns_label(),
+                        if self.session_header { "开" } else { "关" },
                     ),
                     Style::default().fg(Color::DarkGray),
                 ),
@@ -696,17 +871,61 @@ impl SetupWizard {
                     let sel = i == self.cursor;
                     let marker = if sel { "▶ " } else { "  " };
                     let st = if sel {
-                        Style::default().fg(Color::White).add_modifier(Modifier::BOLD)
+                        Style::default()
+                            .fg(Color::White)
+                            .add_modifier(Modifier::BOLD)
                     } else {
                         Style::default().fg(Color::DarkGray)
                     };
-                    let default_model = if m.is_empty() { String::new() } else { format!("(默认 {m})") };
+                    let default_model = if m.is_empty() {
+                        String::new()
+                    } else {
+                        format!("(默认 {m})")
+                    };
                     lines.push(Line::from(vec![
                         Span::styled(marker, Style::default().fg(Color::Cyan)),
                         Span::styled(name.clone(), st),
-                        Span::styled(format!("  {base} {default_model}"), Style::default().fg(Color::DarkGray)),
+                        Span::styled(
+                            format!("  {base} {default_model}"),
+                            Style::default().fg(Color::DarkGray),
+                        ),
                     ]));
                 }
+            }
+            Step::SessionHeader => {
+                lines.push(Line::from(Span::styled(
+                    format!(
+                        "服务商: {} | 是否启用稳定会话头(x-opencode-session)?",
+                        self.provider
+                    ),
+                    Style::default().fg(Color::Yellow),
+                )));
+                lines.push(Line::from(Span::styled(
+                    "同一会话内所有模型请求携带同一稳定值(会话 ID)，提升服务端 KV 缓存命中率；服务端不识别时直接忽略。",
+                    Style::default().fg(Color::DarkGray),
+                )));
+                for (i, label) in ["是(推荐，缓存命中更高)", "否(默认，不发头)"]
+                    .iter()
+                    .enumerate()
+                {
+                    let sel = i == self.session_cursor.min(1);
+                    let marker = if sel { "▶ " } else { "  " };
+                    let st = if sel {
+                        Style::default()
+                            .fg(Color::White)
+                            .add_modifier(Modifier::BOLD)
+                    } else {
+                        Style::default().fg(Color::DarkGray)
+                    };
+                    lines.push(Line::from(vec![
+                        Span::styled(marker, Style::default().fg(Color::Cyan)),
+                        Span::styled((*label).to_string(), st),
+                    ]));
+                }
+                lines.push(Line::from(Span::styled(
+                    "↑↓ 选择 | Y/N 快选 | Enter 下一步(查模型) | Esc 返回改服务商",
+                    Style::default().fg(Color::Cyan),
+                )));
             }
             Step::Querying => {
                 lines.push(Line::from(Span::styled(
@@ -731,11 +950,19 @@ impl SetupWizard {
                     // 只画一个滚动窗口:光标可能落在 25 行之外,以前固定 take(25) 会让
                     // ▶ 移出屏幕、回车选中看不见的那一项
                     let (first, _) = self.model_window();
-                    for (i, m) in self.models.iter().enumerate().skip(first).take(MODEL_WINDOW) {
+                    for (i, m) in self
+                        .models
+                        .iter()
+                        .enumerate()
+                        .skip(first)
+                        .take(MODEL_WINDOW)
+                    {
                         let sel = i == self.model_cursor;
                         let marker = if sel { "▶ " } else { "  " };
                         let st = if sel {
-                            Style::default().fg(Color::White).add_modifier(Modifier::BOLD)
+                            Style::default()
+                                .fg(Color::White)
+                                .add_modifier(Modifier::BOLD)
                         } else {
                             Style::default().fg(Color::DarkGray)
                         };
@@ -762,6 +989,42 @@ impl SetupWizard {
                     )));
                 }
             }
+            Step::ProtocolSelect => {
+                lines.push(Line::from(Span::styled(
+                    format!("服务商: {} | 模型: {}", self.provider, self.model),
+                    Style::default().fg(Color::Green),
+                )));
+                lines.push(Line::from(Span::styled(
+                    "协议类型(↑↓ 选择,Enter 确认;默认 chat,直接回车跳过):",
+                    Style::default().fg(Color::Yellow),
+                )));
+                for (i, p) in [ProtocolKind::Chat, ProtocolKind::Response]
+                    .iter()
+                    .enumerate()
+                {
+                    let sel = i == self.protocol_cursor.min(1);
+                    let marker = if sel { "▶ " } else { "  " };
+                    let st = if sel {
+                        Style::default()
+                            .fg(Color::White)
+                            .add_modifier(Modifier::BOLD)
+                    } else {
+                        Style::default().fg(Color::DarkGray)
+                    };
+                    lines.push(Line::from(vec![
+                        Span::styled(marker, Style::default().fg(Color::Cyan)),
+                        Span::styled(p.label(), st),
+                    ]));
+                }
+                lines.push(Line::from(Span::styled(
+                    "chat = /chat/completions(默认,兼容最广);response = /responses(部分新模型/端点需要)",
+                    Style::default().fg(Color::DarkGray),
+                )));
+                lines.push(Line::from(Span::styled(
+                    "Enter 下一步(API Key)| Esc 返回改模型",
+                    Style::default().fg(Color::Cyan),
+                )));
+            }
             Step::ApiKey => {
                 lines.push(Line::from(Span::styled(
                     format!("服务商: {} | 模型: {}", self.provider, self.model),
@@ -784,10 +1047,13 @@ impl SetupWizard {
                 ]));
                 lines.push(Line::from(vec![
                     Span::styled("上下文窗口: ", Style::default().fg(Color::DarkGray)),
-                    Span::styled(self.context_window_label(), Style::default().fg(Color::White)),
+                    Span::styled(
+                        self.context_window_label(),
+                        Style::default().fg(Color::White),
+                    ),
                 ]));
                 lines.push(Line::from(Span::styled(
-                    "e 输入 key(本地服务可留空)| Enter 下一步(上下文窗口)| s 直接验证并完成 | Esc 返回改模型",
+                    "e 输入 key(本地服务可留空)| Enter 下一步(上下文窗口)| s 直接验证并完成 | Esc 返回改协议",
                     Style::default().fg(Color::Cyan),
                 )));
             }
@@ -800,7 +1066,9 @@ impl SetupWizard {
                     Span::styled("上下文窗口: ", Style::default().fg(Color::DarkGray)),
                     Span::styled(
                         self.context_window_label(),
-                        Style::default().fg(Color::White).add_modifier(Modifier::BOLD),
+                        Style::default()
+                            .fg(Color::White)
+                            .add_modifier(Modifier::BOLD),
                     ),
                 ]));
                 lines.push(Line::from(Span::styled(
@@ -825,7 +1093,9 @@ impl SetupWizard {
                     Span::styled("轮数上限: ", Style::default().fg(Color::DarkGray)),
                     Span::styled(
                         self.max_turns_label(),
-                        Style::default().fg(Color::White).add_modifier(Modifier::BOLD),
+                        Style::default()
+                            .fg(Color::White)
+                            .add_modifier(Modifier::BOLD),
                     ),
                 ]));
                 lines.push(Line::from(Span::styled(
@@ -848,9 +1118,18 @@ impl SetupWizard {
         if self.typing {
             lines.push(Line::from(""));
             lines.push(Line::from(vec![
-                Span::styled("输入: ", Style::default().fg(Color::Green).add_modifier(Modifier::BOLD)),
                 Span::styled(
-                    if self.input_buf.is_empty() { "…" } else { self.input_buf.as_str() },
+                    "输入: ",
+                    Style::default()
+                        .fg(Color::Green)
+                        .add_modifier(Modifier::BOLD),
+                ),
+                Span::styled(
+                    if self.input_buf.is_empty() {
+                        "…"
+                    } else {
+                        self.input_buf.as_str()
+                    },
                     Style::default().fg(Color::Green),
                 ),
                 Span::styled(" _", Style::default().fg(Color::Green)),
@@ -867,7 +1146,9 @@ impl SetupWizard {
             )));
         }
 
-        let p = Paragraph::new(lines).block(Block::default()).style(Style::default());
+        let p = Paragraph::new(lines)
+            .block(Block::default())
+            .style(Style::default());
         f.render_widget(p, inner);
     }
 }
@@ -923,7 +1204,10 @@ mod tests {
         assert_eq!(w.step, Step::ContextWindow);
         w.on_key(key(KeyCode::Enter));
         assert_eq!(w.step, Step::MaxTurns);
-        assert_eq!(w.max_turns_label(), format!("默认({} 轮)", znaide_core::session::DEFAULT_MAX_TURNS));
+        assert_eq!(
+            w.max_turns_label(),
+            format!("默认({} 轮)", znaide_core::session::DEFAULT_MAX_TURNS)
+        );
 
         // 直接敲数字 5 就进输入(不用先按编辑键),继续敲 00 → 500
         w.on_key(key(KeyCode::Char('5')));
@@ -996,6 +1280,7 @@ mod tests {
             max_turns: Some(500),
             persona: None,
             build_tag: None,
+            protocol: None,
             providers: Default::default(),
         };
         w.apply_config(&cfg);
@@ -1029,6 +1314,8 @@ mod tests {
                 api_key_env: Some(VAR.into()),
                 api_key: None,
                 context_window: None,
+                protocol: None,
+                session_header: false,
             },
         );
         let cfg = Config {
@@ -1040,6 +1327,7 @@ mod tests {
             max_turns: None,
             persona: None,
             build_tag: None,
+            protocol: None,
             providers,
         };
         let mut w = SetupWizard::new();
@@ -1067,12 +1355,17 @@ mod tests {
         assert_eq!(w.input_buf, "https://api.example.com/v1sk-abcdefgh");
         assert!(w.typing, "粘贴不该结束输入态");
         assert_eq!(w.step, Step::Provider, "粘贴不该推进步骤");
-        // 仍要按回车才提交
+        // 仍要按回车才提交(先到会话头选择，再确认才查模型)
+        match w.on_key(key(KeyCode::Enter)) {
+            WizardAction::None => {}
+            _ => panic!("回车先到会话头选择"),
+        }
+        assert_eq!(w.step, Step::SessionHeader);
         match w.on_key(key(KeyCode::Enter)) {
             WizardAction::FetchModels { base_url, .. } => {
                 assert_eq!(base_url, "https://api.example.com/v1sk-abcdefgh")
             }
-            _ => panic!("回车才触发动作"),
+            _ => panic!("确认后才触发查询"),
         }
 
         // API Key 输入态同样能粘
@@ -1144,7 +1437,11 @@ mod tests {
             w.base_url, "https://api.deepseek.com/v1",
             "端点要跟着服务商走"
         );
-        assert_eq!(w.context_window, Some(1_048_576), "窗口不能沿用上一家的 40k");
+        assert_eq!(
+            w.context_window,
+            Some(1_048_576),
+            "窗口不能沿用上一家的 40k"
+        );
         assert!(!w.key_from_env, "明文 Key 不该被标成来自环境变量");
         assert!(w.models.is_empty(), "换家后旧模型列表要清掉");
 
@@ -1215,13 +1512,26 @@ mod tests {
     #[test]
     fn select_provider_fetches_models() {
         let mut w = SetupWizard::new();
-        // 找到 deepseek(内置),Enter
+        // 找到 deepseek(内置),Enter → 先到会话头选择(默认否)
         if let Some(i) = w.providers.iter().position(|(n, _, _)| n == "deepseek") {
             w.cursor = i;
         }
         match w.on_key(key(KeyCode::Enter)) {
-            WizardAction::FetchModels { base_url, .. } => {
+            WizardAction::None => {}
+            _ => panic!("选完供应商应先到会话头选择，不直接查模型"),
+        }
+        assert_eq!(w.step, Step::SessionHeader);
+        assert_eq!(w.provider, "deepseek");
+        assert!(!w.session_header);
+        // 默认否 → Enter 确认后才查模型，且不带探针头
+        match w.on_key(key(KeyCode::Enter)) {
+            WizardAction::FetchModels {
+                base_url,
+                session_header,
+                ..
+            } => {
                 assert!(base_url.contains("deepseek"));
+                assert!(session_header.is_none(), "开关关 → 查询不带头");
             }
             _ => panic!("应触发模型查询"),
         }
@@ -1229,8 +1539,104 @@ mod tests {
         assert_eq!(w.provider, "deepseek");
     }
 
+    /// 会话头步骤:Provider Enter → SessionHeader;Y 开/N 关/↑↓切;Enter 确认后查模型;
+    /// 开时 FetchModels 带 wizard- 探针头;draft 带出开关;Esc 逐级回退
     #[test]
-    fn model_injection_then_key_step() {
+    fn session_header_step_flow() {
+        let mut w = SetupWizard::new();
+        if let Some(i) = w.providers.iter().position(|(n, _, _)| n == "deepseek") {
+            w.cursor = i;
+        }
+        w.on_key(key(KeyCode::Enter));
+        assert_eq!(w.step, Step::SessionHeader);
+        // j 切到否(默认已是否)，k 切回是
+        w.on_key(key(KeyCode::Char('k')));
+        assert!(w.session_header);
+        assert_eq!(w.session_cursor, 0);
+        w.on_key(key(KeyCode::Char('j')));
+        assert!(!w.session_header);
+        // Y 直达是 → 直接查模型且带探针头
+        match w.on_key(key(KeyCode::Char('y'))) {
+            WizardAction::FetchModels { session_header, .. } => {
+                let v = session_header.expect("开 → 查询带探针头");
+                assert!(v.starts_with("wizard-"), "got: {v}");
+            }
+            _ => panic!("Y 应确认并查模型"),
+        }
+        assert!(w.session_header);
+        assert_eq!(w.step, Step::Querying);
+        // Esc 回到会话头选择
+        w.on_key(key(KeyCode::Esc));
+        assert_eq!(w.step, Step::SessionHeader);
+        // N 直达否 → 查模型不带头
+        match w.on_key(key(KeyCode::Char('N'))) {
+            WizardAction::FetchModels { session_header, .. } => {
+                assert!(session_header.is_none());
+            }
+            _ => panic!("N 应确认并查模型"),
+        }
+        assert!(!w.session_header);
+        // draft 带出开关
+        assert!(!w.draft().session_header_enabled);
+    }
+
+    /// 换家带开关:A 家开 → 切 B 家(关)不串家;draft 同步
+    #[test]
+    fn switching_provider_carries_session_header() {
+        let mut providers = std::collections::HashMap::new();
+        providers.insert(
+            "a".into(),
+            znaide_core::config::ProviderDef {
+                model: Some("ma".into()),
+                session_header: true,
+                ..Default::default()
+            },
+        );
+        providers.insert(
+            "b".into(),
+            znaide_core::config::ProviderDef {
+                model: Some("mb".into()),
+                ..Default::default()
+            },
+        );
+        let mut w = SetupWizard::new();
+        w.provider_defs = providers;
+        w.apply_provider_defaults("a");
+        assert!(w.session_header);
+        assert_eq!(w.session_cursor, 0);
+        assert!(w.draft().session_header_enabled);
+        w.apply_provider_defaults("b");
+        assert!(!w.session_header);
+        assert_eq!(w.session_cursor, 1);
+        assert!(!w.draft().session_header_enabled);
+    }
+
+    /// apply_config 从条目带出开关
+    #[test]
+    fn apply_config_carries_session_header() {
+        let mut providers = std::collections::HashMap::new();
+        providers.insert(
+            "a".into(),
+            znaide_core::config::ProviderDef {
+                base_url: Some("https://a/v1".into()),
+                model: Some("ma".into()),
+                session_header: true,
+                ..Default::default()
+            },
+        );
+        let cfg = Config {
+            provider: Some("a".into()),
+            providers,
+            ..Default::default()
+        };
+        let mut w = SetupWizard::new();
+        w.apply_config(&cfg);
+        assert!(w.session_header);
+        assert!(w.draft().session_header_enabled);
+    }
+
+    #[test]
+    fn model_injection_then_protocol_step() {
         let mut w = SetupWizard::new();
         w.provider = "ollama".into();
         w.step = Step::Querying;
@@ -1244,7 +1650,66 @@ mod tests {
             _ => panic!(),
         }
         assert_eq!(w.model, "llama3");
+        // 选完模型先到协议选择(默认 chat),不再直达 ApiKey
+        assert_eq!(w.step, Step::ProtocolSelect);
+        assert_eq!(w.protocol, ProtocolKind::Chat);
+        assert_eq!(w.protocol_cursor, 0);
+    }
+
+    /// 协议步骤全流程:ModelSelect Enter → ProtocolSelect;j 切 response;
+    /// Enter → ApiKey;Esc 逐级回退;draft 带出协议;apply_config 预填落在已存值
+    #[test]
+    fn protocol_step_flow() {
+        let mut w = SetupWizard::new();
+        w.provider = "ollama".into();
+        w.step = Step::Querying;
+        w.inject_models(Ok(vec!["qwen3:8b".into()]));
+        w.on_key(key(KeyCode::Enter));
+        assert_eq!(w.step, Step::ProtocolSelect);
+
+        // j 切到 response(所见即所得,移动即赋值)
+        w.on_key(key(KeyCode::Char('j')));
+        assert_eq!(w.protocol, ProtocolKind::Response);
+        assert_eq!(w.protocol_cursor, 1);
+        // k 切回 chat
+        w.on_key(key(KeyCode::Char('k')));
+        assert_eq!(w.protocol, ProtocolKind::Chat);
+        w.on_key(key(KeyCode::Char('j')));
+        assert_eq!(w.protocol, ProtocolKind::Response);
+
+        // Enter → ApiKey;draft 带出协议
+        w.on_key(key(KeyCode::Enter));
         assert_eq!(w.step, Step::ApiKey);
+        assert_eq!(w.draft().protocol, ProtocolKind::Response);
+
+        // Esc 回 ProtocolSelect(保留 response),再 Esc 回 ModelSelect
+        w.on_key(key(KeyCode::Esc));
+        assert_eq!(w.step, Step::ProtocolSelect);
+        assert_eq!(w.protocol, ProtocolKind::Response);
+        w.on_key(key(KeyCode::Esc));
+        assert_eq!(w.step, Step::ModelSelect);
+
+        // apply_config 预填落在已存值上
+        let mut providers = std::collections::HashMap::new();
+        providers.insert(
+            "ollama".into(),
+            znaide_core::config::ProviderDef {
+                base_url: Some("http://127.0.0.1:11434/v1".into()),
+                model: Some("qwen3:8b".into()),
+                protocol: Some(ProtocolKind::Response),
+                ..Default::default()
+            },
+        );
+        let cfg = Config {
+            provider: Some("ollama".into()),
+            providers,
+            ..Default::default()
+        };
+        let mut w2 = SetupWizard::new();
+        w2.apply_config(&cfg);
+        assert_eq!(w2.protocol, ProtocolKind::Response);
+        assert_eq!(w2.protocol_cursor, 1);
+        assert_eq!(w2.draft().protocol, ProtocolKind::Response);
     }
 
     #[test]
@@ -1255,13 +1720,13 @@ mod tests {
         w.inject_models(Err("网络错误".into()));
         assert_eq!(w.step, Step::ModelSelect);
         assert!(w.typing); // 进入手输
-        // 直接输入模型名
+                           // 直接输入模型名
         for c in "my-model".chars() {
             w.on_key(key(KeyCode::Char(c)));
         }
         w.on_key(key(KeyCode::Enter));
         assert_eq!(w.model, "my-model");
-        assert_eq!(w.step, Step::ApiKey);
+        assert_eq!(w.step, Step::ProtocolSelect);
     }
 
     #[test]
@@ -1271,7 +1736,7 @@ mod tests {
         w.cursor = w.providers.len() - 1;
         w.on_key(key(KeyCode::Enter));
         assert!(w.typing); // 等待输入端点
-        // 非法端点被拒绝
+                           // 非法端点被拒绝
         for c in "not-a-url".chars() {
             w.on_key(key(KeyCode::Char(c)));
         }
@@ -1285,6 +1750,14 @@ mod tests {
         for c in "http://127.0.0.1:11434/v1".chars() {
             w.on_key(key(KeyCode::Char(c)));
         }
+        // 端点提交后先到会话头选择(不直接查模型)
+        match w.on_key(key(KeyCode::Enter)) {
+            WizardAction::None => {}
+            _ => panic!("custom 端点提交后应先到会话头选择"),
+        }
+        assert_eq!(w.step, Step::SessionHeader);
+        assert_eq!(w.base_url, "http://127.0.0.1:11434/v1");
+        // 确认(默认否)后才查模型
         match w.on_key(key(KeyCode::Enter)) {
             WizardAction::FetchModels { base_url, .. } => {
                 assert_eq!(base_url, "http://127.0.0.1:11434/v1");
@@ -1379,7 +1852,10 @@ mod tests {
             assert_eq!(w.input_buf, bad);
             assert_eq!(w.context_window, None, "{bad} 不是有效窗口,不该写入");
             w.on_key(key(KeyCode::Esc));
-            assert!(!w.typing && !w.typing_context_window, "Esc 要清掉窗口输入标记");
+            assert!(
+                !w.typing && !w.typing_context_window,
+                "Esc 要清掉窗口输入标记"
+            );
         }
 
         // 本步 Enter → 轮数上限;draft 带上窗口(保存路径要用它)

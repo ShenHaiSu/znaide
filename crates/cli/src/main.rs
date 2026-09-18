@@ -1,17 +1,17 @@
 use clap::Parser;
+use std::path::PathBuf;
 use tokio_util::sync::CancellationToken;
 use znaide_core::config::{Config, Resolved};
-use znaide_core::llm::OpenAiClient;
+use znaide_core::llm::build_llm_client;
 use znaide_core::permissions::Mode;
 use znaide_core::session::Session;
-use std::path::PathBuf;
 
 #[derive(Parser, Debug)]
 #[command(
     name = "znaide",
     version,
     about = "无所不能的终端 AI 助手",
-    long_about = "znaide:跑在终端里的通用 AI 助手。用自然语言下达指令,它自主完成:改文件、跑命令、查资料……\n\n用法示例:\n  znaide                              # 交互模式(终端对话)\n  znaide -p \"把 ~/Downloads 里的 zip 按日期归档\"  # 无头模式执行任务\n\n配置:编辑 ~/.znaide/config.json,或用环境变量 ZNAIDE_MODEL / ZNAIDE_BASE_URL / ZNAIDE_API_KEY(兼容 OPENAI_* 系列)。"
+    long_about = "znaide:跑在终端里的通用 AI 助手。用自然语言下达指令,它自主完成:改文件、跑命令、查资料……\n\n用法示例:\n  znaide                              # 交互模式(终端对话)\n  znaide -p \"把 ~/Downloads 里的 zip 按日期归档\"  # 无头模式执行任务\n\n配置:编辑 ~/.znaide/config.json,或用环境变量 ZNAIDE_MODEL / ZNAIDE_BASE_URL / ZNAIDE_API_KEY / ZNAIDE_PROTOCOL(兼容 OPENAI_* 系列)。"
 )]
 struct Cli {
     /// 无头模式:把指令交给 agent 自主执行
@@ -51,6 +51,19 @@ struct Cli {
     #[arg(long, value_name = "N")]
     max_turns: Option<usize>,
 
+    /// 协议类型:chat(默认)/response(OpenAI Responses /responses)
+    #[arg(long, value_name = "PROTO")]
+    protocol: Option<String>,
+
+    /// 启用稳定会话头(x-opencode-session):同一会话内所有模型请求携带同一稳定值，
+    /// 覆盖配置文件与 ZNAIDE_SESSION_HEADER(当次生效，不写盘)
+    #[arg(long)]
+    session_header: bool,
+
+    /// 关闭稳定会话头(与 --session-header 同时传时以本项为准)
+    #[arg(long)]
+    no_session_header: bool,
+
     /// 检查并安装 GitHub 最新版本(见 --version 查看当前版本)
     #[arg(long)]
     update: bool,
@@ -65,7 +78,9 @@ async fn run_update() -> anyhow::Result<()> {
     let msg = r.describe(&cur);
     // 失败进 stderr(脚本里能分辨),成功/无更新走 stdout
     match r {
-        UpdateResult::CheckFailed(_) | UpdateResult::DownloadFailed(_) | UpdateResult::VerifyFailed(_) => {
+        UpdateResult::CheckFailed(_)
+        | UpdateResult::DownloadFailed(_)
+        | UpdateResult::VerifyFailed(_) => {
             eprintln!("{msg}");
         }
         _ => println!("{msg}"),
@@ -106,11 +121,32 @@ async fn main() -> anyhow::Result<()> {
     }
     // 全局人格(空 = 不注入),随配置持久
     let persona = cfg.persona.clone().unwrap_or_default();
+    // --protocol:非法值警告并当未传(不 hard fail)
+    let cli_protocol =
+        cli.protocol
+            .as_deref()
+            .and_then(|s| match znaide_core::config::ProtocolKind::parse(s) {
+                Some(p) => Some(p),
+                None => {
+                    eprintln!("⚠ --protocol={s:?} 无法识别(应为 chat/response),已忽略");
+                    None
+                }
+            });
+    // 会话头开关:CLI 三态(最高优先级，当次生效，不写盘)
+    let cli_session_header: Option<bool> = if cli.no_session_header {
+        Some(false)
+    } else if cli.session_header {
+        Some(true)
+    } else {
+        None
+    };
     let resolved = cfg.resolve(
         cli.model.clone(),
         cli.base_url.clone(),
         cli.api_key.clone(),
         cli.provider.clone(),
+        cli_protocol,
+        cli_session_header,
     );
     let cwd = cli.cwd.clone().unwrap_or(std::env::current_dir()?);
     if !cwd.is_dir() {
@@ -142,6 +178,8 @@ async fn main() -> anyhow::Result<()> {
                     api_key: None,
                     provider_name: "ollama".into(),
                     context_window: None,
+                    protocol: znaide_core::config::ProtocolKind::Chat,
+                    session_header_enabled: false,
                 }
             });
             // --resume:按 ID/文件名片段定位历史文件,启动即恢复
@@ -199,9 +237,17 @@ fn resolve_resume(target: &str) -> anyhow::Result<PathBuf> {
     }) {
         return Ok(h.path.clone());
     }
-    let mut msg = format!("未找到匹配「{target}」的历史会话。最近 {} 个会话(ID 即文件名,[无头]=命令行 -p 产生):\n", sessions.len().min(8));
+    let mut msg = format!(
+        "未找到匹配「{target}」的历史会话。最近 {} 个会话(ID 即文件名,[无头]=命令行 -p 产生):\n",
+        sessions.len().min(8)
+    );
     for h in sessions.iter().take(8) {
-        let stem = h.path.file_stem().unwrap_or_default().to_string_lossy().to_string();
+        let stem = h
+            .path
+            .file_stem()
+            .unwrap_or_default()
+            .to_string_lossy()
+            .to_string();
         let flag = if h.headless { " [无头]" } else { "" };
         msg.push_str(&format!("  {stem}{flag}\n"));
     }
@@ -226,7 +272,11 @@ fn print_session_stats(s: &znaide_tui::ExitStats) {
     println!(
         "会话时长:{} · 会话 ID:{}",
         fmt_duration(s.uptime_secs),
-        if s.session_id.is_empty() { "-" } else { &s.session_id }
+        if s.session_id.is_empty() {
+            "-"
+        } else {
+            &s.session_id
+        }
     );
     println!(
         "消息:    用户 {} 条 · 助手 {} 条",
@@ -272,7 +322,7 @@ async fn run_headless(
     persona: &str,
     max_turns: Option<usize>,
 ) -> anyhow::Result<()> {
-    let llm = OpenAiClient::new(resolved)?;
+    let llm = build_llm_client(resolved)?;
 
     // MCP(仅当 ~/.znaide/mcp.json 存在)
     let mcp_cfg_path = znaide_core::config::data_dir().join("mcp.json");
@@ -293,6 +343,7 @@ async fn run_headless(
     eprintln!("▶ 正在执行(模型: {},权限: {mode_cn})…", resolved.model);
     let mut session = Session::new(
         llm,
+        resolved.protocol,
         cwd.clone(),
         mode,
         None,
@@ -301,6 +352,7 @@ async fn run_headless(
         None,
         mcp,
         persona,
+        resolved.session_header_enabled,
     )?;
     // 轮数上限:命令行 > config > 默认 200(0 = 不限)
     if let Some(n) = max_turns {
@@ -321,7 +373,10 @@ async fn run_headless(
             result.input_tokens,
             result.output_tokens,
             session.session_id(),
-            session.history_path().map(|p| p.display().to_string()).unwrap_or_default()
+            session
+                .history_path()
+                .map(|p| p.display().to_string())
+                .unwrap_or_default()
         );
     }
     Ok(())

@@ -36,6 +36,8 @@ pub struct Config {
     pub max_turns: Option<usize>,
     /// 全局人格(见 persona 模块);空 = 不注入。切换会写回这里持久生效。
     pub persona: Option<String>,
+    /// 协议类型手动覆盖(chat/response),优先于 provider 条目;面板保存时清空。
+    pub protocol: Option<ProtocolKind>,
     /// 配置格式版本(内部键):保存时缺失自动补齐,供将来迁移判断。
     #[serde(default)]
     pub build_tag: Option<String>,
@@ -45,6 +47,41 @@ pub struct Config {
 /// v2:顶层 model/base_url/api_key/context_window 不再由面板写入,改为搬进对应
 /// provider 条目(顶层只作手动临时覆盖),因此换一次标记触发一次性自愈迁移。
 const CONFIG_TAG: &str = "c6ee35b45916";
+
+/// 协议类型:按 provider 条目存储,与 `context_window` 同口径。
+/// 缺省(chat) = `POST /chat/completions`(现状);`response` = `POST /responses`。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ProtocolKind {
+    #[default]
+    Chat,
+    Response,
+}
+
+impl ProtocolKind {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            ProtocolKind::Chat => "chat",
+            ProtocolKind::Response => "response",
+        }
+    }
+
+    /// 大小写不敏感;`responses`(复数拼写)也认。非法值 → None。
+    pub fn parse(s: &str) -> Option<Self> {
+        match s.trim().to_lowercase().as_str() {
+            "chat" => Some(ProtocolKind::Chat),
+            "response" | "responses" => Some(ProtocolKind::Response),
+            _ => None,
+        }
+    }
+
+    pub fn label(&self) -> &'static str {
+        match self {
+            ProtocolKind::Chat => "chat（对话补全 /chat/completions）",
+            ProtocolKind::Response => "response（Responses /responses）",
+        }
+    }
+}
 
 /// provider 预设:端点 + 默认模型 + key(环境变量名或明文)
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -60,6 +97,12 @@ pub struct ProviderDef {
     /// 该服务商对应模型的上下文窗口(可选)。多 provider 各配各的,
     /// 避免在 40k 的 ollama 与 1M 的云端模型之间切换时占用条算错。
     pub context_window: Option<usize>,
+    /// 该 provider 的协议:None = chat(老配置/未填的默认值)
+    pub protocol: Option<ProtocolKind>,
+    /// 是否为该家启用 x-opencode-session 会话头(默认 false，老配置缺键自动关)。
+    /// 开启后同一会话内所有模型请求携带同一稳定值(会话 ID)，提升服务端 KV 缓存命中率。
+    #[serde(default)]
+    pub session_header: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -71,6 +114,10 @@ pub struct Resolved {
     pub provider_name: String,
     /// 上下文窗口(None = 查内置表)
     pub context_window: Option<usize>,
+    /// 确定值(非 Option):resolve 时已落定,调用方可直接 match
+    pub protocol: ProtocolKind,
+    /// 本次运行是否发会话头(开关，具体头值由 Session 侧供给会话 ID)
+    pub session_header_enabled: bool,
 }
 
 /// 模型窗口内置表(没配 context_window 时按名字匹配)。
@@ -133,6 +180,16 @@ fn model_context_window(model: &str) -> Option<usize> {
 
 fn env_first(names: &[&str]) -> Option<String> {
     names.iter().find_map(|n| std::env::var(n).ok())
+}
+
+/// 解析 ZNAIDE_SESSION_HEADER:1/true/yes/on → 开;0/false/no/off → 关(大小写不敏感);
+/// 空/非法 → None(调用方忽略并提示)。
+pub fn parse_session_header_env(s: &str) -> Option<bool> {
+    match s.trim().to_lowercase().as_str() {
+        "1" | "true" | "yes" | "on" => Some(true),
+        "0" | "false" | "no" | "off" => Some(false),
+        _ => None,
+    }
 }
 
 /// 内置 provider 预设;config.providers 可覆盖同名项
@@ -209,6 +266,14 @@ impl Config {
                     if v.context_window.is_some() {
                         base.context_window = v.context_window;
                     }
+                    if v.protocol.is_some() {
+                        base.protocol = v.protocol;
+                    }
+                    // 布尔只能"或":false 无法覆盖内置 true。内置预设全为 false，故无歧义；
+                    // 将来若内置某家默认开，再改为 Option<bool>。
+                    if v.session_header {
+                        base.session_header = true;
+                    }
                 }
                 None => {
                     m.insert(k.clone(), v.clone());
@@ -236,6 +301,8 @@ impl Config {
         cli_base_url: Option<String>,
         cli_api_key: Option<String>,
         cli_provider: Option<String>,
+        cli_protocol: Option<ProtocolKind>,
+        cli_session_header: Option<bool>,
     ) -> anyhow::Result<Resolved> {
         let provider_name = cli_provider
             .or_else(|| env_first(&["ZNAIDE_PROVIDER"]))
@@ -277,6 +344,39 @@ impl Config {
             .or_else(|| pdef.api_key.clone().filter(|k| !k.is_empty()))
             .or_else(|| pdef.api_key_env.as_ref().and_then(|env| env_first(&[env])));
 
+        // 协议:CLI > env(ZNAIDE_PROTOCOL) > 顶层 config(手动覆盖) > provider 条目 > 默认 Chat。
+        // 非法 env 值忽略并提示,不 hard fail(避免换台机器因拼写起不来)。
+        let env_protocol =
+            env_first(&["ZNAIDE_PROTOCOL"]).and_then(|s| match ProtocolKind::parse(&s) {
+                Some(p) => Some(p),
+                None => {
+                    eprintln!(
+                        "⚠ 环境变量 ZNAIDE_PROTOCOL={s:?} 无法识别(应为 chat/response),已忽略"
+                    );
+                    None
+                }
+            });
+        let protocol = cli_protocol
+            .or(env_protocol)
+            .or(self.protocol)
+            .or(pdef.protocol)
+            .unwrap_or_default();
+
+        // 会话头开关:CLI > env(ZNAIDE_SESSION_HEADER) > provider 条目 > 默认关。
+        // 非法 env 值忽略并提示,不 hard fail(与 ZNAIDE_PROTOCOL 同口径)。
+        let env_session_header = env_first(&["ZNAIDE_SESSION_HEADER"]).and_then(|s| {
+            match parse_session_header_env(&s) {
+                Some(v) => Some(v),
+                None => {
+                    eprintln!("⚠ 环境变量 ZNAIDE_SESSION_HEADER={s:?} 无法识别(应为 1/true/yes/on 或 0/false/no/off),已忽略");
+                    None
+                }
+            }
+        });
+        let session_header_enabled = cli_session_header
+            .or(env_session_header)
+            .unwrap_or(pdef.session_header);
+
         Ok(Resolved {
             model,
             base_url,
@@ -284,9 +384,10 @@ impl Config {
             provider_name,
             // 窗口按 provider 走(各服务商各配各的);顶层那个是历史遗留兜底
             context_window: pdef.context_window.or(self.context_window),
+            protocol,
+            session_header_enabled,
         })
     }
-
 }
 
 impl Resolved {
@@ -312,9 +413,7 @@ impl Config {
         let mut out: Vec<(String, String, String)> = providers
             .into_iter()
             .map(|(name, def)| {
-                let base = def
-                    .base_url
-                    .unwrap_or_else(|| "?".into());
+                let base = def.base_url.unwrap_or_else(|| "?".into());
                 let model = def.model.unwrap_or_else(|| "(未设模型)".into());
                 (name, base, model)
             })
@@ -334,6 +433,10 @@ impl Config {
     /// 不再写顶层三件套——顶层只作手动临时覆盖,面板保存不该把预设永久遮蔽掉。
     /// model/base_url 传 None 表示"保持该条目原值";api_key 传空串表示清除明文。
     /// context_window 传 None 表示"该条目不固定窗口"(按模型名查内置表,查不到 = 未知)。
+    /// protocol 向导永远有确定值:Chat 存 None(= 默认值,config.json 保持干净,
+    /// 老版本读新文件也不受影响)。
+    /// session_header 直接存 bool(无"缺省即默认"的歧义，向导语义明确)。
+    #[allow(clippy::too_many_arguments)]
     pub fn save(
         &mut self,
         provider: &str,
@@ -341,6 +444,8 @@ impl Config {
         base_url: Option<&str>,
         api_key: Option<&str>,
         context_window: Option<usize>,
+        protocol: ProtocolKind,
+        session_header: bool,
     ) -> anyhow::Result<()> {
         self.ensure_build_tag();
         self.provider = Some(provider.to_string());
@@ -358,11 +463,14 @@ impl Config {
             }
             // 0/None 都算"不固定"(0 不是有效窗口,当没填)
             entry.context_window = context_window.filter(|n| *n > 0);
+            entry.protocol = Some(protocol).filter(|p| *p != ProtocolKind::Chat);
+            entry.session_header = session_header;
         }
         // 顶层三件套清空:留着会遮蔽预设,让"切 provider"失效
         self.model = None;
         self.base_url = None;
         self.api_key = None;
+        self.protocol = None;
         self.persist()
     }
 
@@ -421,6 +529,7 @@ impl Config {
             && self.base_url.is_none()
             && self.api_key.is_none()
             && self.context_window.is_none()
+            && self.protocol.is_none()
         {
             return;
         }
@@ -444,6 +553,9 @@ impl Config {
         if let Some(k) = self.api_key.take() {
             entry.api_key = Some(k);
         }
+        if let Some(p) = self.protocol.take() {
+            entry.protocol = Some(p);
+        }
     }
 }
 
@@ -465,9 +577,11 @@ pub fn env_configured() -> bool {
         "ZNAIDE_API_KEY",
         "OPENAI_API_KEY",
     ];
-    names
-        .iter()
-        .any(|n| std::env::var(n).map(|v| !v.trim().is_empty()).unwrap_or(false))
+    names.iter().any(|n| {
+        std::env::var(n)
+            .map(|v| !v.trim().is_empty())
+            .unwrap_or(false)
+    })
 }
 
 /// 建数据目录(memories/skills/sessions),不生成任何配置文件;
@@ -488,7 +602,7 @@ mod tests {
     fn default_resolve_uses_ollama_preset() {
         // 空配置:默认 provider=ollama 自带 base_url+model
         let cfg = Config::default();
-        let r = cfg.resolve(None, None, None, None).unwrap();
+        let r = cfg.resolve(None, None, None, None, None, None).unwrap();
         assert_eq!(r.provider_name, "ollama");
         assert_eq!(r.base_url, "http://localhost:11434/v1");
         assert_eq!(r.model, "qwen3:8b");
@@ -504,11 +618,12 @@ mod tests {
             context_window: None,
             max_turns: None,
             persona: None,
+            protocol: None,
             build_tag: None,
             providers: Default::default(),
         };
         let r = cfg
-            .resolve(Some("cli-model".into()), None, None, None)
+            .resolve(Some("cli-model".into()), None, None, None, None, None)
             .unwrap();
         assert_eq!(r.model, "cli-model");
         assert_eq!(r.base_url, "http://cfg");
@@ -520,9 +635,12 @@ mod tests {
         let cfg = Config::default();
         // 指定 dashscope,无顶层 model → 用预设模型与 key env
         let r = cfg
-            .resolve(None, None, None, Some("dashscope".into()))
+            .resolve(None, None, None, Some("dashscope".into()), None, None)
             .unwrap();
-        assert_eq!(r.base_url, "https://dashscope.aliyuncs.com/compatible-mode/v1");
+        assert_eq!(
+            r.base_url,
+            "https://dashscope.aliyuncs.com/compatible-mode/v1"
+        );
         assert_eq!(r.model, "qwen-plus");
         // api_key 从 env 读不到时应为 None(不报错)
     }
@@ -546,10 +664,11 @@ mod tests {
             context_window: None,
             max_turns: None,
             persona: None,
+            protocol: None,
             build_tag: None,
             providers,
         };
-        let r = cfg.resolve(None, None, None, None).unwrap();
+        let r = cfg.resolve(None, None, None, None, None, None).unwrap();
         assert_eq!(r.base_url, "http://127.0.0.1:8080/v1");
         assert_eq!(r.model, "llama3");
     }
@@ -562,13 +681,13 @@ mod tests {
             context_window: Some(65536),
             ..Default::default()
         };
-        let r = cfg.resolve(None, None, None, None).unwrap();
+        let r = cfg.resolve(None, None, None, None, None, None).unwrap();
         assert_eq!(r.effective_context_window(), Some(65536));
         // 未配置 → 按模型名匹配(2026-09 检索值)
         cfg.context_window = None;
-        let r = cfg.resolve(None, None, None, None).unwrap();
+        let r = cfg.resolve(None, None, None, None, None, None).unwrap();
         assert_eq!(r.effective_context_window(), Some(40960)); // ollama qwen3:8b
-        // 云端/闭源家族
+                                                               // 云端/闭源家族
         assert_eq!(model_context_window("qwen-plus"), Some(1_000_000));
         assert_eq!(model_context_window("claude-sonnet-4-5"), Some(200_000));
         assert_eq!(model_context_window("gpt-5"), Some(400_000));
@@ -585,20 +704,27 @@ mod tests {
     #[test]
     fn unknown_model_window_is_none_not_guess() {
         assert_eq!(model_context_window("my-custom-model"), None);
-        assert_eq!(model_context_window("deepseek-flash-v9-unknown"), Some(1_048_576)); // 命中别名
+        assert_eq!(
+            model_context_window("deepseek-flash-v9-unknown"),
+            Some(1_048_576)
+        ); // 命中别名
         let cfg = Config {
             model: Some("my-custom-model".into()),
             ..Default::default()
         };
-        let r = cfg.resolve(None, None, None, None).unwrap();
-        assert_eq!(r.effective_context_window(), None, "查不到 = 未知,交给调用方只说绝对量");
+        let r = cfg.resolve(None, None, None, None, None, None).unwrap();
+        assert_eq!(
+            r.effective_context_window(),
+            None,
+            "查不到 = 未知,交给调用方只说绝对量"
+        );
         // 面板/配置里写死就照写死(0 无效,当没填)
         let cfg2 = Config {
             model: Some("my-custom-model".into()),
             context_window: Some(262_144),
             ..Default::default()
         };
-        let r2 = cfg2.resolve(None, None, None, None).unwrap();
+        let r2 = cfg2.resolve(None, None, None, None, None, None).unwrap();
         assert_eq!(r2.effective_context_window(), Some(262_144));
     }
 
@@ -637,6 +763,8 @@ mod tests {
             Some("http://127.0.0.1:11434/v1"),
             None,
             None,
+            ProtocolKind::Chat,
+            false,
         )
         .unwrap();
         assert_eq!(Config::load().unwrap().max_turns, Some(500));
@@ -650,6 +778,8 @@ mod tests {
             Some("http://127.0.0.1:11434/v1"),
             None,
             None,
+            ProtocolKind::Chat,
+            false,
         )
         .unwrap();
         assert_eq!(Config::load().unwrap().max_turns, None);
@@ -703,7 +833,11 @@ mod tests {
         };
         let all = cfg.all_providers();
         let d = all.get("deepseek").expect("内置 deepseek 应在");
-        assert_eq!(d.base_url.as_deref(), Some("https://mirror.example.com/v1"), "用户写的覆盖");
+        assert_eq!(
+            d.base_url.as_deref(),
+            Some("https://mirror.example.com/v1"),
+            "用户写的覆盖"
+        );
         assert!(d.model.is_some(), "没写的 model 应保留内置值");
         assert!(d.api_key_env.is_some(), "没写的 api_key_env 应保留内置值");
         // 用户自定义的新 provider 照常加入
@@ -741,14 +875,18 @@ mod tests {
             context_window: Some(9_999_999), // 历史遗留的全局值:不该盖过 provider 自己的
             ..Default::default()
         };
-        let r = cfg.resolve(None, None, None, Some("ollama".into())).unwrap();
+        let r = cfg
+            .resolve(None, None, None, Some("ollama".into()), None, None)
+            .unwrap();
         assert_eq!(r.effective_context_window(), Some(40_960));
         // 没配 provider 窗口时,退回顶层,再退回模型表
         let cfg2 = Config {
             context_window: Some(65_536),
             ..Default::default()
         };
-        let r2 = cfg2.resolve(None, None, None, Some("ollama".into())).unwrap();
+        let r2 = cfg2
+            .resolve(None, None, None, Some("ollama".into()), None, None)
+            .unwrap();
         assert_eq!(r2.effective_context_window(), Some(65_536));
     }
 
@@ -770,6 +908,8 @@ mod tests {
             Some("https://api.deepseek.com/v1"),
             Some("sk-1"),
             Some(131_072),
+            ProtocolKind::Chat,
+            false,
         )
         .unwrap();
 
@@ -780,17 +920,25 @@ mod tests {
         assert_eq!(d.model.as_deref(), Some("deepseek-chat"));
         assert_eq!(d.base_url.as_deref(), Some("https://api.deepseek.com/v1"));
         assert_eq!(d.api_key.as_deref(), Some("sk-1"));
-        assert_eq!(d.context_window, Some(131_072), "窗口也写进条目(多服务商各配各的)");
+        assert_eq!(
+            d.context_window,
+            Some(131_072),
+            "窗口也写进条目(多服务商各配各的)"
+        );
 
         // 落盘后再读,值仍在条目里 → 切 provider 时不会被顶层遮蔽
         let back = Config::load().unwrap();
         assert!(back.model.is_none() && back.base_url.is_none());
         assert_eq!(
-            back.all_providers().get("deepseek").and_then(|d| d.model.clone()),
+            back.all_providers()
+                .get("deepseek")
+                .and_then(|d| d.model.clone()),
             Some("deepseek-chat".to_string())
         );
         assert_eq!(
-            back.all_providers().get("deepseek").and_then(|d| d.context_window),
+            back.all_providers()
+                .get("deepseek")
+                .and_then(|d| d.context_window),
             Some(131_072)
         );
 
@@ -802,11 +950,20 @@ mod tests {
             Some("https://api.deepseek.com/v1"),
             None,
             None,
+            ProtocolKind::Chat,
+            false,
         )
         .unwrap();
-        assert_eq!(cfg.providers.get("deepseek").and_then(|d| d.context_window), None);
         assert_eq!(
-            Config::load().unwrap().providers.get("deepseek").and_then(|d| d.context_window),
+            cfg.providers.get("deepseek").and_then(|d| d.context_window),
+            None
+        );
+        assert_eq!(
+            Config::load()
+                .unwrap()
+                .providers
+                .get("deepseek")
+                .and_then(|d| d.context_window),
             None
         );
 
@@ -833,7 +990,7 @@ mod tests {
         }}"#
         );
         let before: Config = serde_json::from_str(&raw).unwrap();
-        let eff_before = before.resolve(None, None, None, None).unwrap();
+        let eff_before = before.resolve(None, None, None, None, None, None).unwrap();
 
         let mut after: Config = serde_json::from_str(&raw).unwrap();
         after.build_tag = Some(CONFIG_TAG.to_string());
@@ -842,7 +999,11 @@ mod tests {
         assert!(after.model.is_none() && after.base_url.is_none() && after.api_key.is_none());
         assert!(after.context_window.is_none(), "顶层窗口也该搬走");
         let d = after.providers.get("deepseek").unwrap();
-        assert_eq!(d.model.as_deref(), Some("deepseek-flash"), "顶层值生效过 → 覆盖条目");
+        assert_eq!(
+            d.model.as_deref(),
+            Some("deepseek-flash"),
+            "顶层值生效过 → 覆盖条目"
+        );
         assert_eq!(d.base_url.as_deref(), Some("https://api.deepseek.com/v1"));
         assert_eq!(d.context_window, Some(65_536));
         assert_eq!(
@@ -852,7 +1013,7 @@ mod tests {
         );
 
         // 迁移前后生效参数必须一模一样
-        let eff_after = after.resolve(None, None, None, None).unwrap();
+        let eff_after = after.resolve(None, None, None, None, None, None).unwrap();
         assert_eq!(eff_before.model, eff_after.model);
         assert_eq!(eff_before.base_url, eff_after.base_url);
         assert_eq!(eff_before.api_key, eff_after.api_key);
@@ -861,7 +1022,9 @@ mod tests {
             eff_after.effective_context_window()
         );
         // 另一个 provider 不受影响,切过去仍好使(这正是本次修复的目的)
-        let other = after.resolve(None, None, None, Some("ollama".into())).unwrap();
+        let other = after
+            .resolve(None, None, None, Some("ollama".into()), None, None)
+            .unwrap();
         assert_eq!(other.model, "qwen3:8b");
         assert_eq!(other.base_url, "http://127.0.0.1:11434/v1");
 
@@ -873,14 +1036,356 @@ mod tests {
             "providers": { "ollama": {"model": "qwen3:8b", "api_key": "sk-old"} }
         }"#;
         let mut b: Config = serde_json::from_str(raw_b).unwrap();
-        let eff_b = b.resolve(None, None, None, None).unwrap();
-        assert_eq!(eff_b.api_key.as_deref(), Some("sk-top"), "顶层覆盖预设(三个字段口径一致)");
-        b.absorb_top_level_into_provider();
-        assert_eq!(b.providers.get("ollama").unwrap().api_key.as_deref(), Some("sk-top"));
+        let eff_b = b.resolve(None, None, None, None, None, None).unwrap();
         assert_eq!(
-            b.resolve(None, None, None, None).unwrap().api_key.as_deref(),
+            eff_b.api_key.as_deref(),
+            Some("sk-top"),
+            "顶层覆盖预设(三个字段口径一致)"
+        );
+        b.absorb_top_level_into_provider();
+        assert_eq!(
+            b.providers.get("ollama").unwrap().api_key.as_deref(),
+            Some("sk-top")
+        );
+        assert_eq!(
+            b.resolve(None, None, None, None, None, None)
+                .unwrap()
+                .api_key
+                .as_deref(),
             Some("sk-top"),
             "搬完生效 key 不变"
         );
+    }
+
+    /// 协议默认值:空配置 → Chat;`ProtocolKind::default()` 也是 Chat
+    #[test]
+    fn protocol_default_chat() {
+        assert_eq!(ProtocolKind::default(), ProtocolKind::Chat);
+        let cfg = Config::default();
+        let r = cfg.resolve(None, None, None, None, None, None).unwrap();
+        assert_eq!(r.protocol, ProtocolKind::Chat);
+    }
+
+    /// 协议按 provider 走:A=Response、B 缺省 → 各自生效;字段级合并(只写 base_url
+    /// 的用户条目不丢内置 protocol…反之亦然:只写 protocol 的条目不丢内置 base_url)
+    #[test]
+    fn protocol_per_provider() {
+        let mut providers = std::collections::HashMap::new();
+        providers.insert(
+            "a".into(),
+            ProviderDef {
+                model: Some("model-a".into()),
+                protocol: Some(ProtocolKind::Response),
+                ..Default::default()
+            },
+        );
+        let cfg = Config {
+            providers,
+            ..Default::default()
+        };
+        let ra = cfg
+            .resolve(None, None, None, Some("a".into()), None, None)
+            .unwrap();
+        assert_eq!(ra.protocol, ProtocolKind::Response);
+        // 只写 protocol 的条目:base_url 回退默认,不 panic
+        assert!(!ra.base_url.is_empty());
+        let rb = cfg
+            .resolve(None, None, None, Some("ollama".into()), None, None)
+            .unwrap();
+        assert_eq!(rb.protocol, ProtocolKind::Chat);
+
+        // 只写 base_url 的用户条目不丢内置其他字段(字段级合并不断言 protocol,
+        // 内置全是 None→Chat;这里只确认合并逻辑没把条目整条替换)
+        let mut providers2 = std::collections::HashMap::new();
+        providers2.insert(
+            "deepseek".into(),
+            ProviderDef {
+                base_url: Some("https://mirror.example.com/v1".into()),
+                protocol: Some(ProtocolKind::Response),
+                ..Default::default()
+            },
+        );
+        let cfg2 = Config {
+            providers: providers2,
+            ..Default::default()
+        };
+        let all = cfg2.all_providers();
+        let d = all.get("deepseek").unwrap();
+        assert_eq!(d.base_url.as_deref(), Some("https://mirror.example.com/v1"));
+        assert_eq!(d.protocol, Some(ProtocolKind::Response));
+        assert!(d.model.is_some(), "没写的 model 应保留内置值");
+    }
+
+    /// env 与 CLI 优先级:env 生效;CLI 覆盖 env;顶层覆盖条目
+    #[test]
+    fn protocol_env_and_cli() {
+        let _g = crate::test_util::DATA_DIR_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        std::env::set_var("ZNAIDE_PROTOCOL", "response");
+        let cfg = Config::default();
+        let r = cfg.resolve(None, None, None, None, None, None).unwrap();
+        assert_eq!(r.protocol, ProtocolKind::Response);
+        // CLI 覆盖 env
+        let r2 = cfg
+            .resolve(None, None, None, None, Some(ProtocolKind::Chat), None)
+            .unwrap();
+        assert_eq!(r2.protocol, ProtocolKind::Chat);
+        std::env::remove_var("ZNAIDE_PROTOCOL");
+
+        // 顶层覆盖条目
+        let mut providers = std::collections::HashMap::new();
+        providers.insert(
+            "ollama".into(),
+            ProviderDef {
+                protocol: Some(ProtocolKind::Response),
+                ..Default::default()
+            },
+        );
+        let cfg3 = Config {
+            protocol: Some(ProtocolKind::Chat),
+            providers,
+            ..Default::default()
+        };
+        let r3 = cfg3.resolve(None, None, None, None, None, None).unwrap();
+        assert_eq!(r3.protocol, ProtocolKind::Chat, "顶层手动覆盖优先于条目");
+    }
+
+    /// save 落盘:Response 存入 → 读回 Some(Response);Chat 存入 → 条目 None(干净性);
+    /// 顶层 protocol 被清空
+    #[test]
+    fn protocol_save_roundtrip() {
+        let _g = crate::test_util::DATA_DIR_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let dir = std::env::temp_dir().join(format!("znaide_cfg_proto_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::env::set_var("ZNAIDE_DATA_DIR", &dir);
+
+        let mut cfg = Config::load().unwrap_or_default();
+        cfg.protocol = Some(ProtocolKind::Response); // 顶层残留应被清空
+        cfg.save(
+            "ollama",
+            Some("qwen3:8b"),
+            Some("http://127.0.0.1:11434/v1"),
+            None,
+            None,
+            ProtocolKind::Response,
+            false,
+        )
+        .unwrap();
+        assert_eq!(cfg.protocol, None, "顶层 protocol 随保存清空");
+        let back = Config::load().unwrap();
+        assert_eq!(
+            back.providers.get("ollama").and_then(|d| d.protocol),
+            Some(ProtocolKind::Response)
+        );
+        let r = back.resolve(None, None, None, None, None, None).unwrap();
+        assert_eq!(r.protocol, ProtocolKind::Response);
+
+        // Chat 存入 → 条目 None(干净性:老版本读新文件不受影响)
+        let mut cfg2 = back;
+        cfg2.save(
+            "ollama",
+            Some("qwen3:8b"),
+            Some("http://127.0.0.1:11434/v1"),
+            None,
+            None,
+            ProtocolKind::Chat,
+            false,
+        )
+        .unwrap();
+        assert_eq!(
+            Config::load()
+                .unwrap()
+                .providers
+                .get("ollama")
+                .and_then(|d| d.protocol),
+            None
+        );
+
+        std::env::remove_var("ZNAIDE_DATA_DIR");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 老配置(无 protocol 键)零迁移:读为 None → resolve 得 Chat
+    #[test]
+    fn legacy_config_no_protocol() {
+        let legacy: Config = serde_json::from_str(r#"{"model":"m"}"#).unwrap();
+        assert_eq!(legacy.protocol, None);
+        let r = legacy.resolve(None, None, None, None, None, None).unwrap();
+        assert_eq!(r.protocol, ProtocolKind::Chat);
+        // 条目里的老格式同样
+        let legacy2: Config = serde_json::from_str(r#"{"providers":{"x":{"model":"m"}}}"#).unwrap();
+        assert_eq!(legacy2.providers["x"].protocol, None);
+    }
+
+    /// 非法值 → None;复数/大小写也认
+    #[test]
+    fn parse_invalid_protocol() {
+        assert_eq!(ProtocolKind::parse("foo"), None);
+        assert_eq!(ProtocolKind::parse(""), None);
+        assert_eq!(
+            ProtocolKind::parse("Responses"),
+            Some(ProtocolKind::Response)
+        );
+        assert_eq!(
+            ProtocolKind::parse("RESPONSE"),
+            Some(ProtocolKind::Response)
+        );
+        assert_eq!(ProtocolKind::parse("chat"), Some(ProtocolKind::Chat));
+        assert_eq!(ProtocolKind::parse("CHAT"), Some(ProtocolKind::Chat));
+        assert_eq!(ProtocolKind::Chat.as_str(), "chat");
+        assert_eq!(ProtocolKind::Response.as_str(), "response");
+    }
+
+    /// 会话头开关:老配置缺键默认关(零回归)
+    #[test]
+    fn session_header_legacy_defaults_off() {
+        let legacy: Config = serde_json::from_str(r#"{"model":"m"}"#).unwrap();
+        assert!(!legacy
+            .providers
+            .get("x")
+            .map(|d| d.session_header)
+            .unwrap_or(false));
+        assert!(!ProviderDef::default().session_header);
+        let r = legacy.resolve(None, None, None, None, None, None).unwrap();
+        assert!(!r.session_header_enabled, "老配置无该键 → 不发头");
+    }
+
+    /// 会话头开关:字段级合并只"或"(用户开 → 合并后开)
+    #[test]
+    fn session_header_merges_or() {
+        let mut providers = std::collections::HashMap::new();
+        providers.insert(
+            "ollama".into(),
+            ProviderDef {
+                session_header: true,
+                ..Default::default()
+            },
+        );
+        let cfg = Config {
+            providers,
+            ..Default::default()
+        };
+        assert!(cfg.all_providers()["ollama"].session_header);
+        let r = cfg.resolve(None, None, None, None, None, None).unwrap();
+        assert!(r.session_header_enabled);
+        // 用户没写 → 内置 false 保留
+        let cfg2 = Config::default();
+        assert!(!cfg2.all_providers()["ollama"].session_header);
+    }
+
+    /// 会话头开关:env 解析(1/true/yes/on 开;0/false/no/off 关;非法忽略)
+    #[test]
+    fn session_header_env_parsing() {
+        assert_eq!(parse_session_header_env("1"), Some(true));
+        assert_eq!(parse_session_header_env("true"), Some(true));
+        assert_eq!(parse_session_header_env("YES"), Some(true));
+        assert_eq!(parse_session_header_env("on"), Some(true));
+        assert_eq!(parse_session_header_env("0"), Some(false));
+        assert_eq!(parse_session_header_env("false"), Some(false));
+        assert_eq!(parse_session_header_env("No"), Some(false));
+        assert_eq!(parse_session_header_env("off"), Some(false));
+        assert_eq!(parse_session_header_env(""), None);
+        assert_eq!(parse_session_header_env("maybe"), None);
+    }
+
+    /// 会话头开关:env 生效;CLI 压住 env/文件
+    #[test]
+    fn session_header_env_and_cli_precedence() {
+        let _g = crate::test_util::DATA_DIR_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        // 文件开
+        let mut providers = std::collections::HashMap::new();
+        providers.insert(
+            "ollama".into(),
+            ProviderDef {
+                session_header: true,
+                ..Default::default()
+            },
+        );
+        let cfg = Config {
+            providers,
+            ..Default::default()
+        };
+        // 无 env/CLI → 文件值
+        std::env::remove_var("ZNAIDE_SESSION_HEADER");
+        let r = cfg.resolve(None, None, None, None, None, None).unwrap();
+        assert!(r.session_header_enabled);
+        // env 关 → 压住文件开
+        std::env::set_var("ZNAIDE_SESSION_HEADER", "0");
+        let r = cfg.resolve(None, None, None, None, None, None).unwrap();
+        assert!(!r.session_header_enabled);
+        // CLI 开 → 压住 env 关
+        let r = cfg
+            .resolve(None, None, None, None, None, Some(true))
+            .unwrap();
+        assert!(r.session_header_enabled);
+        // CLI 关 → 压住文件开
+        std::env::remove_var("ZNAIDE_SESSION_HEADER");
+        let r = cfg
+            .resolve(None, None, None, None, None, Some(false))
+            .unwrap();
+        assert!(!r.session_header_enabled);
+        std::env::remove_var("ZNAIDE_SESSION_HEADER");
+    }
+
+    /// 会话头开关:save 落盘读回
+    #[test]
+    fn session_header_save_roundtrip() {
+        let _g = crate::test_util::DATA_DIR_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let dir = std::env::temp_dir().join(format!("znaide_cfg_sh_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::env::set_var("ZNAIDE_DATA_DIR", &dir);
+
+        let mut cfg = Config::load().unwrap_or_default();
+        cfg.save(
+            "deepseek",
+            Some("deepseek-chat"),
+            Some("https://api.deepseek.com/v1"),
+            None,
+            None,
+            ProtocolKind::Chat,
+            true,
+        )
+        .unwrap();
+        let back = Config::load().unwrap();
+        assert_eq!(
+            back.providers.get("deepseek").map(|d| d.session_header),
+            Some(true)
+        );
+        std::env::remove_var("ZNAIDE_SESSION_HEADER");
+        let r = back.resolve(None, None, None, None, None, None).unwrap();
+        assert!(r.session_header_enabled);
+
+        // 关 → 写回 false
+        let mut cfg = back;
+        cfg.save(
+            "deepseek",
+            Some("deepseek-chat"),
+            Some("https://api.deepseek.com/v1"),
+            None,
+            None,
+            ProtocolKind::Chat,
+            false,
+        )
+        .unwrap();
+        assert_eq!(
+            Config::load()
+                .unwrap()
+                .providers
+                .get("deepseek")
+                .map(|d| d.session_header),
+            Some(false)
+        );
+
+        std::env::remove_var("ZNAIDE_DATA_DIR");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
