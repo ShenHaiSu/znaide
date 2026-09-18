@@ -210,12 +210,17 @@ impl ToolCallAccumulator {
 
 impl OpenAiClient {
     pub fn new(cfg: &Resolved) -> anyhow::Result<Self> {
-        let http = reqwest::Client::builder()
+        let mut builder = reqwest::Client::builder()
             .timeout(std::time::Duration::from_secs(600))
             // 连接阶段单独限时(DNS/拒连/半开黑洞 10s 内报错),
             // 而不是干等 600s 总超时才失败
-            .connect_timeout(std::time::Duration::from_secs(10))
-            .build()?;
+            .connect_timeout(std::time::Duration::from_secs(10));
+        // 代理走环境变量(HTTPS_PROXY/ALL_PROXY/HTTP_PROXY,NO_PROXY 豁免本地地址),
+        // 未设置即直连;本地 ollama 默认不受影响
+        if let Some(p) = crate::update::proxy_from_env() {
+            builder = builder.proxy(p);
+        }
+        let http = builder.build()?;
         Ok(Self {
             http,
             base_url: cfg.base_url.trim_end_matches('/').to_string(),

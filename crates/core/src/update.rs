@@ -161,12 +161,11 @@ pub fn version_gt(a: &str, b: &str) -> bool {
     false
 }
 
-/// 组装发布下载用 HTTP 客户端(尊重代理环境变量)
-pub fn http_client() -> anyhow::Result<reqwest::Client> {
-    let mut b = reqwest::Client::builder()
-        .connect_timeout(std::time::Duration::from_secs(10))
-        .timeout(std::time::Duration::from_secs(240))
-        .user_agent(concat!("znaide-updater/", env!("CARGO_PKG_VERSION")));
+/// 从环境变量读取代理(顺序: HTTPS_PROXY → ALL_PROXY → HTTP_PROXY,大小写均可),
+/// 返回可直接塞进 `ClientBuilder::proxy` 的 `reqwest::Proxy`。
+/// 未设置或解析失败返回 `None`(直连)。
+/// `NO_PROXY/no_proxy` 一并处理:本地 `ollama` 等地址不走代理。
+pub fn proxy_from_env() -> Option<reqwest::Proxy> {
     for var in [
         "HTTPS_PROXY",
         "https_proxy",
@@ -178,12 +177,41 @@ pub fn http_client() -> anyhow::Result<reqwest::Client> {
         if let Ok(v) = std::env::var(var) {
             let v = v.trim().to_string();
             if !v.is_empty() {
-                if let Ok(p) = reqwest::Proxy::all(&v) {
-                    b = b.proxy(p);
+                if let Ok(mut p) = reqwest::Proxy::all(&v) {
+                    if let Some(no) = reqwest::NoProxy::from_string(
+                        &no_proxy_from_env().unwrap_or_default(),
+                    ) {
+                        p = p.no_proxy(Some(no));
+                    }
+                    return Some(p);
                 }
-                break;
             }
         }
+    }
+    None
+}
+
+/// 读 `NO_PROXY/no_proxy` 环境变量(逗号分隔),未设置返回 `None`。
+fn no_proxy_from_env() -> Option<String> {
+    for var in ["NO_PROXY", "no_proxy"] {
+        if let Ok(v) = std::env::var(var) {
+            let v = v.trim().to_string();
+            if !v.is_empty() {
+                return Some(v);
+            }
+        }
+    }
+    None
+}
+
+/// 组装发布下载用 HTTP 客户端(尊重代理环境变量)
+pub fn http_client() -> anyhow::Result<reqwest::Client> {
+    let mut b = reqwest::Client::builder()
+        .connect_timeout(std::time::Duration::from_secs(10))
+        .timeout(std::time::Duration::from_secs(240))
+        .user_agent(concat!("znaide-updater/", env!("CARGO_PKG_VERSION")));
+    if let Some(p) = proxy_from_env() {
+        b = b.proxy(p);
     }
     Ok(b.build()?)
 }
@@ -431,6 +459,26 @@ pub fn verify_download(exe: &Path, expect_version: &str) -> anyhow::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn proxy_from_env_reads_and_clears() {
+        // 单函数覆盖"有/无"两种情况:多测试并行改同一批 env 会打架
+        for v in [
+            "HTTPS_PROXY",
+            "https_proxy",
+            "ALL_PROXY",
+            "all_proxy",
+            "HTTP_PROXY",
+            "http_proxy",
+        ] {
+            std::env::remove_var(v);
+        }
+        assert!(proxy_from_env().is_none(), "未设置时代理应为直连");
+        std::env::set_var("HTTPS_PROXY", "http://127.0.0.1:10808");
+        assert!(proxy_from_env().is_some(), "HTTPS_PROXY 应被识别");
+        std::env::remove_var("HTTPS_PROXY");
+        assert!(proxy_from_env().is_none());
+    }
 
     #[test]
     fn version_compare() {
