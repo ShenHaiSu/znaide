@@ -585,6 +585,7 @@ pub async fn probe_models(
         // GET /models 与协议无关,随便填 Chat
         protocol: crate::config::ProtocolKind::Chat,
         session_header_enabled: session_header.is_some(),
+        retry: crate::config::RetryConfig::disabled(),
     };
     let mut client = OpenAiClient::new(&cfg)?;
     if let Some(v) = session_header {
@@ -821,6 +822,7 @@ mod tests {
             context_window: None,
             protocol: crate::config::ProtocolKind::Chat,
             session_header_enabled: enabled,
+            retry: crate::config::RetryConfig::disabled(),
         }
     }
 

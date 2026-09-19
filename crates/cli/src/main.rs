@@ -64,6 +64,15 @@ struct Cli {
     #[arg(long)]
     no_session_header: bool,
 
+    /// 弱网增强重试次数(单次模型调用遇空回复/可重试错误后的追加次数，0..=8)。
+    /// 当次生效，不写盘；缺省取 config 的 retry(默认关闭)。--no-retry 优先。
+    #[arg(long, value_name = "N")]
+    retry: Option<usize>,
+
+    /// 关闭弱网重试(与 --retry 同时传时以本项为准)
+    #[arg(long)]
+    no_retry: bool,
+
     /// 检查并安装 GitHub 最新版本(见 --version 查看当前版本)
     #[arg(long)]
     update: bool,
@@ -140,7 +149,7 @@ async fn main() -> anyhow::Result<()> {
     } else {
         None
     };
-    let resolved = cfg.resolve(
+    let mut resolved = cfg.resolve(
         cli.model.clone(),
         cli.base_url.clone(),
         cli.api_key.clone(),
@@ -148,6 +157,11 @@ async fn main() -> anyhow::Result<()> {
         cli_protocol,
         cli_session_header,
     );
+    // 弱网重试：CLI(--retry/--no-retry) > ENV > config 文件，当次生效不写盘
+    let retry_override = cfg.resolve_retry(cli.retry, cli.no_retry);
+    if let Ok(r) = resolved.as_mut() {
+        r.retry = retry_override;
+    }
     let cwd = cli.cwd.clone().unwrap_or(std::env::current_dir()?);
     if !cwd.is_dir() {
         anyhow::bail!("工作目录不存在: {}", cwd.display());
@@ -180,6 +194,7 @@ async fn main() -> anyhow::Result<()> {
                     context_window: None,
                     protocol: znaide_core::config::ProtocolKind::Chat,
                     session_header_enabled: false,
+                    retry: znaide_core::config::RetryConfig::disabled(),
                 }
             });
             // --resume:按 ID/文件名片段定位历史文件,启动即恢复
@@ -360,6 +375,8 @@ async fn run_headless(
     } else if let Ok(cfg) = znaide_core::config::Config::load() {
         session.set_max_turns(cfg.effective_max_turns());
     }
+    // 弱网重试:resolved.retry 已含 CLI/ENV/config 优先级结果，直接生效
+    session.set_retry(resolved.retry);
     let result = session
         .run_turn(prompt)
         .await

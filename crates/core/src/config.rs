@@ -38,10 +38,79 @@ pub struct Config {
     pub persona: Option<String>,
     /// 协议类型手动覆盖(chat/response),优先于 provider 条目;面板保存时清空。
     pub protocol: Option<ProtocolKind>,
+    /// 弱网增强重试(默认关闭)。开启后单次模型调用遇空回复/可重试错误时
+    /// 按次数重试(统一退避)，耗尽才算彻底失败。
+    #[serde(default)]
+    pub retry: RetryConfig,
     /// 配置格式版本(内部键):保存时缺失自动补齐,供将来迁移判断。
     #[serde(default)]
     pub build_tag: Option<String>,
 }
+
+/// 弱网重试配置(顶层 `retry`)。默认关闭，零行为变化。
+/// `max_retries` = 首次失败后的追加次数(3 即最多调 1+3=4 次)，落定时夹取 0..=8。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct RetryConfig {
+    #[serde(default)]
+    pub enabled: bool,
+    #[serde(default = "default_retry_times")]
+    pub max_retries: usize,
+}
+
+fn default_retry_times() -> usize {
+    3
+}
+
+impl Default for RetryConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            max_retries: default_retry_times(),
+        }
+    }
+}
+
+impl RetryConfig {
+    /// 允许的档位：关闭/3/5/8/手动(0..=8)。非法值返回 Err 提示。
+    pub fn from_option(max_retries: Option<usize>) -> Self {
+        match max_retries {
+            None => Self {
+                enabled: false,
+                max_retries: default_retry_times(),
+            },
+            Some(n) => Self {
+                enabled: true,
+                max_retries: n.min(MAX_RETRIES),
+            },
+        }
+    }
+
+    pub fn enabled_with(n: usize) -> Self {
+        Self {
+            enabled: true,
+            max_retries: n.min(MAX_RETRIES),
+        }
+    }
+
+    pub fn disabled() -> Self {
+        Self::default()
+    }
+
+    /// 生效次数(关 = 0；开 = 夹取后的值)
+    pub fn effective_times(&self) -> usize {
+        if self.enabled {
+            self.max_retries.min(MAX_RETRIES)
+        } else {
+            0
+        }
+    }
+}
+
+/// 重试次数上限(手动输入也夹取到此值)
+pub const MAX_RETRIES: usize = 8;
+/// 统一退避基准(毫秒)：delay = BASE * 2^attempt + 0~200ms 抖动
+pub const RETRY_BACKOFF_BASE_MS: u64 = 800;
 
 /// 当前配置格式版本(写入 config.json 的 build_tag)。
 /// v2:顶层 model/base_url/api_key/context_window 不再由面板写入,改为搬进对应
@@ -118,6 +187,8 @@ pub struct Resolved {
     pub protocol: ProtocolKind,
     /// 本次运行是否发会话头(开关，具体头值由 Session 侧供给会话 ID)
     pub session_header_enabled: bool,
+    /// 弱网重试策略(resolve 时已落定，含 CLI/ENV 覆盖)
+    pub retry: RetryConfig,
 }
 
 /// 模型窗口内置表(没配 context_window 时按名字匹配)。
@@ -377,6 +448,11 @@ impl Config {
             .or(env_session_header)
             .unwrap_or(pdef.session_header);
 
+        // 重试策略：resolve() 只落定 config 文件值；CLI/ENV 覆盖由 resolve_retry() 统一处理，
+        // 调用方在 resolve() 之后用它覆写 resolved.retry（保持 resolve 签名不变，老调用方零改动）。
+        let mut retry = self.retry;
+        retry.max_retries = retry.max_retries.min(MAX_RETRIES);
+
         Ok(Resolved {
             model,
             base_url,
@@ -386,7 +462,44 @@ impl Config {
             context_window: pdef.context_window.or(self.context_window),
             protocol,
             session_header_enabled,
+            retry,
         })
+    }
+
+    /// 弱网重试最终策略，优先级：CLI(--retry/--no-retry) > ENV > config 文件。
+    /// ENV：ZNAIDE_NO_RETRY=1/true 强制关；ZNAIDE_RETRY=N(N>0 开 N 次，0 关)。
+    /// 返回值已夹取 0..=MAX_RETRIES。
+    pub fn resolve_retry(
+        &self,
+        cli_retry: Option<usize>,
+        cli_no_retry: bool,
+    ) -> RetryConfig {
+        if cli_no_retry {
+            return RetryConfig::disabled();
+        }
+        if let Some(n) = cli_retry {
+            return RetryConfig::enabled_with(n);
+        }
+        if let Some(v) = env_first(&["ZNAIDE_NO_RETRY"]) {
+            if matches!(v.trim().to_lowercase().as_str(), "1" | "true" | "yes" | "on") {
+                return RetryConfig::disabled();
+            }
+        }
+        if let Some(v) = env_first(&["ZNAIDE_RETRY"]) {
+            let t = v.trim();
+            if !t.is_empty() {
+                match t.parse::<usize>() {
+                    Ok(0) => return RetryConfig::disabled(),
+                    Ok(n) => return RetryConfig::enabled_with(n),
+                    Err(_) => eprintln!(
+                        "⚠ 环境变量 ZNAIDE_RETRY={v:?} 无法识别(应为 0..=8 的整数),已忽略"
+                    ),
+                }
+            }
+        }
+        let mut r = self.retry;
+        r.max_retries = r.max_retries.min(MAX_RETRIES);
+        r
     }
 }
 
@@ -619,6 +732,7 @@ mod tests {
             max_turns: None,
             persona: None,
             protocol: None,
+            retry: RetryConfig::disabled(),
             build_tag: None,
             providers: Default::default(),
         };
@@ -665,6 +779,7 @@ mod tests {
             max_turns: None,
             persona: None,
             protocol: None,
+            retry: RetryConfig::disabled(),
             build_tag: None,
             providers,
         };
@@ -1387,5 +1502,41 @@ mod tests {
 
         std::env::remove_var("ZNAIDE_DATA_DIR");
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 弱网重试默认关闭；resolve() 落定文件值
+    #[test]
+    fn retry_defaults_to_disabled() {
+        let cfg = Config::default();
+        assert_eq!(cfg.retry.effective_times(), 0);
+        let r = cfg.resolve(None, None, None, None, None, None).unwrap();
+        assert_eq!(r.retry.effective_times(), 0);
+    }
+
+    /// resolve_retry 优先级：CLI > ENV > config 文件；超限夹取 8
+    #[test]
+    fn retry_cli_env_config_priority() {
+        let _g = crate::test_util::DATA_DIR_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        std::env::remove_var("ZNAIDE_RETRY");
+        std::env::remove_var("ZNAIDE_NO_RETRY");
+        let mut cfg = Config::default();
+        cfg.retry = RetryConfig::enabled_with(5);
+        // config 文件值
+        assert_eq!(cfg.resolve_retry(None, false).effective_times(), 5);
+        // ENV 覆盖 config
+        std::env::set_var("ZNAIDE_RETRY", "3");
+        assert_eq!(cfg.resolve_retry(None, false).effective_times(), 3);
+        // CLI 覆盖 ENV
+        assert_eq!(cfg.resolve_retry(Some(8), false).effective_times(), 8);
+        // 超限夹取
+        assert_eq!(cfg.resolve_retry(Some(99), false).effective_times(), 8);
+        // --no-retry / ENV 关闭优先
+        assert_eq!(cfg.resolve_retry(Some(5), true).effective_times(), 0);
+        std::env::remove_var("ZNAIDE_RETRY");
+        std::env::set_var("ZNAIDE_NO_RETRY", "1");
+        assert_eq!(cfg.resolve_retry(None, false).effective_times(), 0);
+        std::env::remove_var("ZNAIDE_NO_RETRY");
     }
 }

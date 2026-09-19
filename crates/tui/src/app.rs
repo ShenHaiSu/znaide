@@ -312,6 +312,8 @@ pub async fn run(
     let session_protocol = resolved.protocol;
     // 会话头开关同样 spawn 前取出(跟 provider 走的配置快照)
     let session_header_enabled = resolved.session_header_enabled;
+    // 弱网重试同样 spawn 前取出(RetryConfig 是 Copy)
+    let session_retry = resolved.retry;
     let (ev_tx, mut ev_rx) = mpsc::unbounded_channel::<SessionEvent>();
     let (cmd_tx, mut cmd_rx) = mpsc::unbounded_channel::<AgentCmd>();
     // 更新进度/结果通知(update task → UI)
@@ -370,6 +372,9 @@ pub async fn run(
         // 轮数上限:--max-turns > config 的 max_turns(0 = 不限)> 默认。
         // 以前这里只读 config,`znaide --max-turns N` 在交互模式下被静默忽略。
         session.set_max_turns(effective_max_turns(max_turns));
+        // 弱网重试:resolved.retry 已含 CLI/ENV/config 优先级结果；/config 重配经
+        // Reconfigure → session.reconfigure() 即时更新。
+        session.set_retry(session_retry);
         // 运行中插话:引擎在每个轮边界从这个投递箱取一条插进对话(见 InputQueue)
         session.set_inbox(inbox_agent);
         if !persona.is_empty() {
@@ -1224,6 +1229,8 @@ pub async fn run(
                                     znaide_core::config::Config::load().unwrap_or_default();
                                 // 面板里填的轮数上限一起落盘(空 = 清除,回到默认 200)
                                 cfg.max_turns = w.max_turns;
+                                // 弱网重试一起落盘(顶层 retry，默认关闭)
+                                cfg.retry = w.retry;
                                 // Key 来自环境变量时不写明文(留空即保持环境变量那条路)
                                 let key_arg = if w.key_from_env {
                                     None
@@ -1916,6 +1923,21 @@ fn handle_session_event(
                 Some(MsgItem::AssistantStream(s)) => s.push_str(&t),
                 _ => items.push(MsgItem::AssistantStream(t)),
             }
+        }
+        SessionEvent::LlmRetrying { attempt, max, reason } => {
+            // 弱网重试：丢弃本轮已吐出的部分流式内容，只保留最终成功的一次。
+            // 本轮前面已落定的工具卡片/历史不受影响：只从尾部向前清掉连续的
+            // AssistantStream/Reasoning（当前 attempt 的半截输出），停在第一张非流式卡片。
+            while matches!(
+                items.last(),
+                Some(MsgItem::AssistantStream(_) | MsgItem::Reasoning(_))
+            ) {
+                items.pop();
+            }
+            stats.round_est = 0;
+            items.push(MsgItem::Notice(format!(
+                "↻ 弱网重试 {attempt}/{max}（{reason}），已丢弃部分输出…"
+            )));
         }
         SessionEvent::Usage { prompt, completion } => {
             // 该轮真实用量到账:输入/输出分别累计,进行中估算清零(已按真实记账)
@@ -3694,6 +3716,42 @@ mod token_tests {
         assert_eq!(st.round_est, 0);
         assert_eq!(st.input, 100);
         assert_eq!(st.output, 40);
+    }
+
+    /// 弱网重试：丢弃本轮半截流式内容，只保留最终成功的一次；估算清零并留一条提示
+    #[test]
+    fn llm_retrying_discards_partial_stream() {
+        let mut items = Vec::new();
+        let mut busy = false;
+        let mut kind = BusyKind::Work;
+        let mut perm = None;
+        let mut sid = String::new();
+        let mut persona = String::new();
+        let mut st = TokenStats::default();
+        macro_rules! fire {
+            ($e:expr) => {
+                handle_session_event(
+                    $e, &mut items, &mut busy, &mut kind, &mut perm, &mut sid,
+                    &mut persona, &mut st,
+                )
+            };
+        }
+        fire!(SessionEvent::TurnStarted);
+        fire!(SessionEvent::TextDelta("半截输出".into()));
+        fire!(SessionEvent::ReasoningDelta("半截思考".into()));
+        assert!(st.round_est > 0);
+        fire!(SessionEvent::LlmRetrying {
+            attempt: 1,
+            max: 3,
+            reason: "空回复".into(),
+        });
+        // 半截内容被清掉，只剩一条重试提示；估算清零
+        assert_eq!(st.round_est, 0);
+        assert_eq!(items.len(), 1);
+        assert!(matches!(&items[0], MsgItem::Notice(t) if t.contains("1/3")));
+        // 最终成功的那次增量正常追加
+        fire!(SessionEvent::TextDelta("完整成功".into()));
+        assert!(matches!(&items[1], MsgItem::AssistantStream(s) if s == "完整成功"));
     }
 
     /// 静默预算毫秒 → 人读:整分钟缩写,否则秒

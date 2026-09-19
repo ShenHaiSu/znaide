@@ -1082,6 +1082,7 @@ mod tests {
             context_window: None,
             protocol: crate::config::ProtocolKind::Response,
             session_header_enabled: enabled,
+            retry: crate::config::RetryConfig::disabled(),
         }
     }
 

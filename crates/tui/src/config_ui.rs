@@ -10,6 +10,7 @@ use znaide_core::config::Config;
 use znaide_core::config::ProtocolKind;
 use znaide_core::config::ProviderDef;
 use znaide_core::config::Resolved;
+use znaide_core::config::RetryConfig;
 
 /// 向导步骤
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -30,6 +31,8 @@ pub enum Step {
     ContextWindow,
     /// 轮数上限(单条消息最多几轮模型往返;0 = 不限)
     MaxTurns,
+    /// 弱网重试(单次模型调用遇空回复/可重试错误后的追加次数;关闭/3/5/8/手动)
+    Retry,
     /// 正在验证(等待宿主回调)
     Verifying,
 }
@@ -96,6 +99,13 @@ pub struct SetupWizard {
     pub typing_max_turns: bool,
     /// 当前 typing 输入的是 context_window
     pub typing_context_window: bool,
+    /// 弱网重试策略(默认关闭)。由 `prefill()` 带出、保存时写进顶层 retry；
+    /// draft 进 Resolved，随重配即时生效。
+    pub retry: RetryConfig,
+    /// 重试档位游标(0=关闭, 1=3次, 2=5次, 3=8次, 4=手动输入)
+    pub retry_cursor: usize,
+    /// 当前 typing 输入的是 retry 手动次数
+    pub typing_retry: bool,
     /// Key 来自环境变量(api_key_env):面板里显示为空但实际可用
     pub key_from_env: bool,
     /// 打开面板时快照的合并后 provider 表:切服务商时按名字取"它自己"的
@@ -128,6 +138,9 @@ impl SetupWizard {
             session_cursor: 1,
             typing_max_turns: false,
             typing_context_window: false,
+            retry: RetryConfig::disabled(),
+            retry_cursor: 0,
+            typing_retry: false,
             key_from_env: false,
             provider_defs: std::collections::HashMap::new(),
         }
@@ -245,6 +258,20 @@ impl SetupWizard {
         // 会话头:当前 provider 条目值(缺键 = 关)。顶层无该开关，不参与覆盖。
         self.session_header = def.as_ref().map(|d| d.session_header).unwrap_or(false);
         self.session_cursor = if self.session_header { 0 } else { 1 };
+        // 弱网重试:顶层 retry(缺键 = 关闭)。游标落在当前档位上。
+        let mut retry = cfg.retry;
+        retry.max_retries = retry.max_retries.min(znaide_core::config::MAX_RETRIES);
+        self.retry = retry;
+        self.retry_cursor = if !retry.enabled {
+            0
+        } else {
+            match retry.max_retries {
+                3 => 1,
+                5 => 2,
+                8 => 3,
+                _ => 4,
+            }
+        };
     }
 
     /// 是否已有配置可展示(首次运行全空 → 不显示摘要行)
@@ -258,6 +285,15 @@ impl SetupWizard {
             None => format!("默认({} 轮)", znaide_core::session::DEFAULT_MAX_TURNS),
             Some(0) => "不限".to_string(),
             Some(n) => format!("{n} 轮"),
+        }
+    }
+
+    /// 弱网重试的展示文案
+    pub fn retry_label(&self) -> String {
+        if !self.retry.enabled {
+            "关闭".to_string()
+        } else {
+            format!("开启(失败后追加 {} 次)", self.retry.max_retries)
         }
     }
 
@@ -299,6 +335,7 @@ impl SetupWizard {
             context_window: self.context_window,
             protocol: self.protocol,
             session_header_enabled: self.session_header,
+            retry: self.retry,
         }
     }
 
@@ -315,6 +352,32 @@ impl SetupWizard {
             ProtocolKind::Response => 1,
         };
         self.step = Step::ProtocolSelect;
+    }
+
+    /// 进入弱网重试:光标落在当前档位上(关闭/3/5/8/手动)
+    fn enter_retry(&mut self) {
+        self.retry_cursor = if !self.retry.enabled {
+            0
+        } else {
+            match self.retry.max_retries {
+                3 => 1,
+                5 => 2,
+                8 => 3,
+                _ => 4,
+            }
+        };
+        self.step = Step::Retry;
+    }
+
+    /// 档位游标变化即时落到 retry(手动档保持原值，进输入后才改)
+    fn apply_retry_cursor(&mut self) {
+        match self.retry_cursor {
+            0 => self.retry = RetryConfig::disabled(),
+            1 => self.retry = RetryConfig::enabled_with(3),
+            2 => self.retry = RetryConfig::enabled_with(5),
+            3 => self.retry = RetryConfig::enabled_with(8),
+            _ => {}
+        }
     }
 
     /// 宿主注入模型查询结果
@@ -406,6 +469,7 @@ impl SetupWizard {
                     self.typing = false;
                     self.typing_max_turns = false;
                     self.typing_context_window = false;
+                    self.typing_retry = false;
                     self.input_buf.clear();
                 }
                 KeyCode::Backspace => {
@@ -659,10 +723,9 @@ impl SetupWizard {
                     WizardAction::None
                 }
                 KeyCode::Enter | KeyCode::Char('s') | KeyCode::Char('S') => {
-                    // 完成:验证(用当前轮数上限)
-                    self.step = Step::Verifying;
-                    self.progress = format!("正在验证 {} / {} …", self.provider, self.model);
-                    WizardAction::Verify(self.draft())
+                    // 下一步:弱网重试
+                    self.enter_retry();
+                    WizardAction::None
                 }
                 KeyCode::Esc => {
                     self.step = Step::ContextWindow;
@@ -670,10 +733,78 @@ impl SetupWizard {
                 }
                 _ => WizardAction::None,
             },
-            Step::Verifying => {
-                // 等待宿主;按 Esc 回到上一步(轮数上限)
-                if matches!(key.code, KeyCode::Esc) {
+            Step::Retry => match key.code {
+                KeyCode::Up | KeyCode::Char('k') => {
+                    self.retry_cursor = self.retry_cursor.saturating_sub(1);
+                    self.apply_retry_cursor();
+                    WizardAction::None
+                }
+                KeyCode::Down | KeyCode::Char('j') => {
+                    self.retry_cursor = (self.retry_cursor + 1).min(4);
+                    self.apply_retry_cursor();
+                    WizardAction::None
+                }
+                // 直接敲数字进手动输入(0..=8，超限夹取)
+                KeyCode::Char(c) if c.is_ascii_digit() => {
+                    self.typing = true;
+                    self.typing_retry = true;
+                    self.input_buf.clear();
+                    self.input_buf.push(c);
+                    self.notice =
+                        "输入弱网重试次数(空/0 = 关闭，1..=8，超限按 8 算):".into();
+                    WizardAction::None
+                }
+                KeyCode::Char('t')
+                | KeyCode::Char('T')
+                | KeyCode::Char('e')
+                | KeyCode::Char('E') => {
+                    self.typing = true;
+                    self.typing_retry = true;
+                    self.input_buf = if self.retry.enabled {
+                        self.retry.max_retries.to_string()
+                    } else {
+                        String::new()
+                    };
+                    self.notice =
+                        "输入弱网重试次数(空/0 = 关闭，1..=8，超限按 8 算):".into();
+                    WizardAction::None
+                }
+                KeyCode::Enter => {
+                    if self.retry_cursor >= 4 {
+                        // 手动输入
+                        self.typing = true;
+                        self.typing_retry = true;
+                        self.input_buf = if self.retry.enabled {
+                            self.retry.max_retries.to_string()
+                        } else {
+                            String::new()
+                        };
+                        self.notice =
+                            "输入弱网重试次数(空/0 = 关闭，1..=8，超限按 8 算):".into();
+                        WizardAction::None
+                    } else {
+                        // 完成:验证
+                        self.step = Step::Verifying;
+                        self.progress = format!("正在验证 {} / {} …", self.provider, self.model);
+                        WizardAction::Verify(self.draft())
+                    }
+                }
+                KeyCode::Char('s') | KeyCode::Char('S') => {
+                    // 完成:验证(用当前重试档位)
+                    self.step = Step::Verifying;
+                    self.progress = format!("正在验证 {} / {} …", self.provider, self.model);
+                    WizardAction::Verify(self.draft())
+                }
+                KeyCode::Esc => {
                     self.step = Step::MaxTurns;
+                    WizardAction::None
+                }
+                _ => WizardAction::None,
+            },
+            Step::Verifying => {
+                // 等待宿主;按 Esc 回到上一步(弱网重试)
+                if matches!(key.code, KeyCode::Esc) {
+                    self.step = Step::Retry;
                 }
                 WizardAction::None
             }
@@ -740,6 +871,44 @@ impl SetupWizard {
                 }
             };
         }
+        // 弱网重试次数:空/0 = 关闭，1..=8 开启(超限夹取 8)
+        if self.typing_retry {
+            self.typing_retry = false;
+            let t = v.trim();
+            if t.is_empty() {
+                self.retry = RetryConfig::disabled();
+                self.retry_cursor = 0;
+                self.notice = "弱网重试:关闭。按 s 验证并完成".into();
+                return WizardAction::None;
+            }
+            return match t.parse::<usize>() {
+                Ok(0) => {
+                    self.retry = RetryConfig::disabled();
+                    self.retry_cursor = 0;
+                    self.notice = "弱网重试:关闭。按 s 验证并完成".into();
+                    WizardAction::None
+                }
+                Ok(n) => {
+                    let n = n.min(znaide_core::config::MAX_RETRIES);
+                    self.retry = RetryConfig::enabled_with(n);
+                    self.retry_cursor = match n {
+                        3 => 1,
+                        5 => 2,
+                        8 => 3,
+                        _ => 4,
+                    };
+                    self.notice = format!("弱网重试:开启(失败后追加 {n} 次)。按 s 验证并完成");
+                    WizardAction::None
+                }
+                Err(_) => {
+                    self.input_buf = t.to_string();
+                    self.typing = true;
+                    self.typing_retry = true;
+                    self.notice = "重试次数要填 0..=8 的整数(空 = 关闭)，请重新输入:".into();
+                    WizardAction::None
+                }
+            };
+        }
         match self.step {
             // 自定义服务商:提交的是端点,先问会话头,确认后才查询模型
             Step::Provider if self.provider == "custom" => {
@@ -798,7 +967,8 @@ impl SetupWizard {
             "5 API Key",
             "6 上下文窗口",
             "7 轮数上限",
-            "8 验证",
+            "8 弱网重试",
+            "9 验证",
         ];
         let current = match self.step {
             Step::Provider => 0,
@@ -808,7 +978,8 @@ impl SetupWizard {
             Step::ApiKey => 4,
             Step::ContextWindow => 5,
             Step::MaxTurns => 6,
-            Step::Verifying => 7,
+            Step::Retry => 7,
+            Step::Verifying => 8,
         };
         let mut bar: Vec<Span> = Vec::new();
         for (i, s) in steps.iter().enumerate() {
@@ -848,11 +1019,12 @@ impl SetupWizard {
                 ),
                 Span::styled(
                     format!(
-                        "  端点 {}  Key {}  窗口 {}  轮数 {}  会话头 {}",
+                        "  端点 {}  Key {}  窗口 {}  轮数 {}  重试 {}  会话头 {}",
                         self.base_url,
                         key,
                         self.context_window_label(),
                         self.max_turns_label(),
+                        self.retry_label(),
                         if self.session_header { "开" } else { "关" },
                     ),
                     Style::default().fg(Color::DarkGray),
@@ -1103,7 +1275,54 @@ impl SetupWizard {
                     Style::default().fg(Color::DarkGray),
                 )));
                 lines.push(Line::from(Span::styled(
-                    "直接输入数字修改(0 = 不限,留空 = 默认)| Enter 或 s 验证并完成 | Esc 返回改窗口",
+                    "直接输入数字修改(0 = 不限,留空 = 默认)| Enter 或 s 下一步(弱网重试) | Esc 返回改窗口",
+                    Style::default().fg(Color::Cyan),
+                )));
+            }
+            Step::Retry => {
+                lines.push(Line::from(Span::styled(
+                    format!("服务商: {} | 模型: {}", self.provider, self.model),
+                    Style::default().fg(Color::Green),
+                )));
+                lines.push(Line::from(vec![
+                    Span::styled("弱网重试: ", Style::default().fg(Color::DarkGray)),
+                    Span::styled(
+                        self.retry_label(),
+                        Style::default()
+                            .fg(Color::White)
+                            .add_modifier(Modifier::BOLD),
+                    ),
+                ]));
+                lines.push(Line::from(Span::styled(
+                    "单次模型调用遇空回复/网络错误时的追加次数(统一退避 800ms*2^n)；耗尽才算彻底失败",
+                    Style::default().fg(Color::DarkGray),
+                )));
+                for (i, label) in [
+                    "关闭(默认)",
+                    "开启：追加 3 次",
+                    "开启：追加 5 次",
+                    "开启：追加 8 次",
+                    "手动输入次数…",
+                ]
+                .iter()
+                .enumerate()
+                {
+                    let sel = i == self.retry_cursor.min(4);
+                    let marker = if sel { "▶ " } else { "  " };
+                    let st = if sel {
+                        Style::default()
+                            .fg(Color::White)
+                            .add_modifier(Modifier::BOLD)
+                    } else {
+                        Style::default().fg(Color::DarkGray)
+                    };
+                    lines.push(Line::from(vec![
+                        Span::styled(marker, Style::default().fg(Color::Cyan)),
+                        Span::styled(label.to_string(), st),
+                    ]));
+                }
+                lines.push(Line::from(Span::styled(
+                    "↑↓ 选择档位(手动档回车后输入 0..=8)| Enter 或 s 验证并完成 | Esc 返回改轮数",
                     Style::default().fg(Color::Cyan),
                 )));
             }
@@ -1253,15 +1472,25 @@ mod tests {
         assert!(!w.typing && !w.typing_max_turns);
         assert_eq!(w.step, Step::MaxTurns, "Esc 只退输入,不退步骤");
 
-        // 本步按 Enter → 验证(带上当前轮数上限)
+        // 本步按 Enter → 弱网重试(带上当前轮数上限)
         w.max_turns = Some(300);
-        match w.on_key(key(KeyCode::Enter)) {
+        assert!(matches!(w.on_key(key(KeyCode::Enter)), WizardAction::None));
+        assert_eq!(w.step, Step::Retry);
+
+        // 重试档位默认关闭；选 5 次后按 s → 验证
+        assert_eq!(w.retry_label(), "关闭");
+        w.on_key(key(KeyCode::Down));
+        w.on_key(key(KeyCode::Down));
+        assert!(w.retry.enabled && w.retry.max_retries == 5);
+        match w.on_key(key(KeyCode::Char('s'))) {
             WizardAction::Verify(r) => assert_eq!(r.model, "qwen3:8b"),
-            _ => panic!("Enter 应触发验证"),
+            _ => panic!("s 应触发验证"),
         }
         assert_eq!(w.step, Step::Verifying);
 
-        // Esc 从验证回退到本步
+        // Esc 从验证回退到重试，再 Esc 回轮数上限
+        w.on_key(key(KeyCode::Esc));
+        assert_eq!(w.step, Step::Retry);
         w.on_key(key(KeyCode::Esc));
         assert_eq!(w.step, Step::MaxTurns);
     }
@@ -1281,6 +1510,7 @@ mod tests {
             persona: None,
             build_tag: None,
             protocol: None,
+            retry: RetryConfig::disabled(),
             providers: Default::default(),
         };
         w.apply_config(&cfg);
@@ -1328,6 +1558,7 @@ mod tests {
             persona: None,
             build_tag: None,
             protocol: None,
+            retry: RetryConfig::disabled(),
             providers,
         };
         let mut w = SetupWizard::new();
@@ -1864,8 +2095,10 @@ mod tests {
         assert_eq!(w.step, Step::MaxTurns);
         assert_eq!(w.draft().context_window, Some(131_072));
 
-        // Esc 链:验证 → 轮数上限 → 上下文窗口
+        // Esc 链:验证 → 弱网重试 → 轮数上限 → 上下文窗口
         w.step = Step::Verifying;
+        w.on_key(key(KeyCode::Esc));
+        assert_eq!(w.step, Step::Retry);
         w.on_key(key(KeyCode::Esc));
         assert_eq!(w.step, Step::MaxTurns);
         w.on_key(key(KeyCode::Esc));

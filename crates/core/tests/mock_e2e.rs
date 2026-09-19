@@ -136,6 +136,7 @@ async fn sse_stream_accumulates_text() {
         context_window: None,
         protocol: znaide_core::config::ProtocolKind::Chat,
         session_header_enabled: false,
+        retry: znaide_core::config::RetryConfig::disabled(),
     };
     let client = build_llm_client(&cfg).unwrap();
     let mut deltas: Vec<String> = Vec::new();
@@ -178,6 +179,7 @@ async fn sse_stream_accumulates_tool_calls() {
         context_window: None,
         protocol: znaide_core::config::ProtocolKind::Chat,
         session_header_enabled: false,
+        retry: znaide_core::config::RetryConfig::disabled(),
     };
     let client = build_llm_client(&cfg).unwrap();
     let reply = client
@@ -230,6 +232,7 @@ async fn session_run_turn_executes_tools() {
         context_window: None,
         protocol: znaide_core::config::ProtocolKind::Chat,
         session_header_enabled: false,
+        retry: znaide_core::config::RetryConfig::disabled(),
     };
     let llm = build_llm_client(&cfg).unwrap();
     let mut session = Session::new(
@@ -302,6 +305,7 @@ async fn queued_message_is_injected_at_round_boundary() {
         context_window: None,
         protocol: znaide_core::config::ProtocolKind::Chat,
         session_header_enabled: false,
+        retry: znaide_core::config::RetryConfig::disabled(),
     };
     let llm = build_llm_client(&cfg).unwrap();
     let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
@@ -402,6 +406,7 @@ async fn session_clear_context_wipes_messages_and_history() {
         context_window: None,
         protocol: znaide_core::config::ProtocolKind::Chat,
         session_header_enabled: false,
+        retry: znaide_core::config::RetryConfig::disabled(),
     };
     let llm = build_llm_client(&cfg).unwrap();
     let sid = format!("clear_test_{}", std::process::id());
@@ -465,6 +470,7 @@ async fn headless_session_lazy_file_meta_and_resume() {
         context_window: None,
         protocol: znaide_core::config::ProtocolKind::Chat,
         session_header_enabled: false,
+        retry: znaide_core::config::RetryConfig::disabled(),
     };
     let sid = format!("meta_test_{}", std::process::id());
     let hp = znaide_core::config::data_dir()
@@ -546,6 +552,7 @@ async fn interactive_session_writes_schema_meta() {
         context_window: None,
         protocol: znaide_core::config::ProtocolKind::Chat,
         session_header_enabled: false,
+        retry: znaide_core::config::RetryConfig::disabled(),
     };
     let sid = format!("imeta_test_{}", std::process::id());
     let hp = znaide_core::config::data_dir()
@@ -606,6 +613,7 @@ async fn load_history_takes_over_session_identity() {
         context_window: None,
         protocol: znaide_core::config::ProtocolKind::Chat,
         session_header_enabled: false,
+        retry: znaide_core::config::RetryConfig::disabled(),
     };
     let llm = build_llm_client(&cfg).unwrap();
 
@@ -699,6 +707,7 @@ async fn foreign_schema_in_history_emits_notice() {
         context_window: None,
         protocol: znaide_core::config::ProtocolKind::Chat,
         session_header_enabled: false,
+        retry: znaide_core::config::RetryConfig::disabled(),
     };
     let hp = znaide_core::config::data_dir()
         .join("sessions")
@@ -856,6 +865,7 @@ async fn tool_call_survives_sse_line_split_across_network_chunks() {
         context_window: None,
         protocol: znaide_core::config::ProtocolKind::Chat,
         session_header_enabled: false,
+        retry: znaide_core::config::RetryConfig::disabled(),
     };
     let client = build_llm_client(&cfg).unwrap();
     let reply = client
@@ -916,6 +926,7 @@ async fn empty_and_null_tool_arguments_keep_loop_alive() {
         context_window: None,
         protocol: znaide_core::config::ProtocolKind::Chat,
         session_header_enabled: false,
+        retry: znaide_core::config::RetryConfig::disabled(),
     };
     let llm = build_llm_client(&cfg).unwrap();
     let mut session = Session::new(
@@ -1014,6 +1025,7 @@ async fn model_invokes_skill_with_entry_script() {
         context_window: None,
         protocol: znaide_core::config::ProtocolKind::Chat,
         session_header_enabled: false,
+        retry: znaide_core::config::RetryConfig::disabled(),
     };
     let llm = build_llm_client(&cfg).unwrap();
     let mut session = Session::new(
@@ -1064,6 +1076,7 @@ async fn manual_skill_unknown_name_fails_gracefully() {
         context_window: None,
         protocol: znaide_core::config::ProtocolKind::Chat,
         session_header_enabled: false,
+        retry: znaide_core::config::RetryConfig::disabled(),
     };
     let llm = build_llm_client(&cfg).unwrap();
     let mut session = Session::new(
@@ -1132,6 +1145,7 @@ async fn compact_context_shrinks_next_request() {
         context_window: None,
         protocol: znaide_core::config::ProtocolKind::Chat,
         session_header_enabled: false,
+        retry: znaide_core::config::RetryConfig::disabled(),
     };
     let llm = build_llm_client(&cfg).unwrap();
     let mut session = Session::new(
@@ -1189,6 +1203,7 @@ async fn session_turn_error_notifies_and_finishes() {
         context_window: None,
         protocol: znaide_core::config::ProtocolKind::Chat,
         session_header_enabled: false,
+        retry: znaide_core::config::RetryConfig::disabled(),
     };
     let llm = build_llm_client(&cfg).unwrap();
     let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
@@ -1254,6 +1269,7 @@ async fn round_budget_exhausted_reports_headless() {
         context_window: None,
         protocol: znaide_core::config::ProtocolKind::Chat,
         session_header_enabled: false,
+        retry: znaide_core::config::RetryConfig::disabled(),
     };
     let llm = build_llm_client(&cfg).unwrap();
     let mut session = Session::new(
@@ -1317,6 +1333,7 @@ async fn max_turns_zero_means_unlimited() {
         context_window: None,
         protocol: znaide_core::config::ProtocolKind::Chat,
         session_header_enabled: false,
+        retry: znaide_core::config::RetryConfig::disabled(),
     };
     let llm = build_llm_client(&cfg).unwrap();
     let mut session = Session::new(
@@ -1387,6 +1404,7 @@ async fn round_started_events_report_progress() {
         context_window: None,
         protocol: znaide_core::config::ProtocolKind::Chat,
         session_header_enabled: false,
+        retry: znaide_core::config::RetryConfig::disabled(),
     };
     let llm = build_llm_client(&cfg).unwrap();
     let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
@@ -1455,6 +1473,7 @@ async fn repeated_identical_call_is_stopped() {
         context_window: None,
         protocol: znaide_core::config::ProtocolKind::Chat,
         session_header_enabled: false,
+        retry: znaide_core::config::RetryConfig::disabled(),
     };
     let llm = build_llm_client(&cfg).unwrap();
     let mut session = Session::new(
@@ -1499,6 +1518,7 @@ fn responses_cfg(base: String) -> Resolved {
         context_window: None,
         protocol: znaide_core::config::ProtocolKind::Response,
         session_header_enabled: false,
+        retry: znaide_core::config::RetryConfig::disabled(),
     }
 }
 

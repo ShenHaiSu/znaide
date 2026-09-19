@@ -32,6 +32,14 @@ pub enum SessionEvent {
     ReasoningDelta(String),
     /// 正文增量
     TextDelta(String),
+    /// 弱网重试：单次模型调用遇空回复/可重试错误、且还有次数时发出。
+    /// UI 收到后丢弃本轮已追加的部分流式内容（只保留最终成功的一次），
+    /// 并可展示“↻ 重试 i/N”提示。无头模式(events=None)不发。
+    LlmRetrying {
+        attempt: usize,
+        max: usize,
+        reason: String,
+    },
     /// 工具开始执行
     ToolStarted {
         name: String,
@@ -173,6 +181,9 @@ pub struct Session {
     /// 会话头开关(跟 provider 走的配置快照)。具体头值 = session_id，
     /// 建会话/恢复/重配后经 set_session_header 推给 client。
     session_header_enabled: bool,
+    /// 弱网重试策略(默认关闭)。单次模型调用遇空回复/可重试错误时按次数重试，
+    /// 统一退避；耗尽才算彻底失败。`set_retry` / `reconfigure` 更新。
+    retry: crate::config::RetryConfig,
 }
 
 impl Session {
@@ -225,6 +236,7 @@ impl Session {
             persona: persona.to_string(),
             inbox: None,
             session_header_enabled,
+            retry: crate::config::RetryConfig::disabled(),
         };
         // ID 落定后立即把开关 + 真实 ID 推给 client(任何 llm 调用前)；
         // 关 → client 保持无头
@@ -269,12 +281,26 @@ impl Session {
         // 开关变化即时生效:开→关清掉旧值;关→开用当前会话 ID 补上。
         // (同协议的 llm.reconfigure 只做"保留旧值"，这里统一刷成最新语义)
         self.set_session_header(resolved.session_header_enabled);
+        // 重试策略同样即时生效(/config 改完下一轮调用即用新值)
+        self.set_retry(resolved.retry);
     }
 
     /// 设置单条消息的轮数上限(0 = 不限)。CLI `--max-turns` 与 config 的
     /// `max_turns` 都从这里进来;/config 改动后由宿主重新调用即可即时生效。
     pub fn set_max_turns(&mut self, n: usize) {
         self.max_turns = n;
+    }
+
+    /// 设置弱网重试策略(CLI `--retry` / ENV / `/config` 改动后调用，即时生效)。
+    pub fn set_retry(&mut self, retry: crate::config::RetryConfig) {
+        let mut r = retry;
+        r.max_retries = r.max_retries.min(crate::config::MAX_RETRIES);
+        self.retry = r;
+    }
+
+    /// 当前重试策略(宿主展示/调试用)
+    pub fn retry(&self) -> crate::config::RetryConfig {
+        self.retry
     }
 
     /// 设置运行中插话的投递箱(交互宿主专用)。引擎在**每个轮边界**取一条插进历史,
@@ -286,6 +312,16 @@ impl Session {
     /// 从投递箱取一条待插话的消息(没设投递箱或为空 → None;锁中毒也不致命,当空处理)
     fn take_inbox_message(&self) -> Option<String> {
         self.inbox.as_ref()?.lock().ok()?.pop_front()
+    }
+
+    /// 弱网重试统一退避：delay = 800ms * 2^attempt + 0~199ms 抖动。
+    /// 等待可被 Esc 取消；返回 true = 等待期间被取消（调用方直接中断收尾）。
+    async fn wait_retry_backoff(&self, attempt_idx: usize) -> bool {
+        let ms = retry_backoff_ms(attempt_idx);
+        tokio::select! {
+            _ = tokio::time::sleep(std::time::Duration::from_millis(ms)) => false,
+            _ = self.cancel.cancelled() => true,
+        }
     }
 
     pub fn history_path(&self) -> Option<&Path> {
@@ -392,16 +428,52 @@ impl Session {
             ),
             ChatMessage::user(body),
         ];
-        let reply = self.llm.chat(&sum_msgs, None).await;
-        let reply = match reply {
-            Ok(r) => r,
-            Err(e) => {
-                // 失败:复位 UI 状态,保持原上下文不动
-                self.emit(SessionEvent::TurnFinished {
-                    text: String::new(),
-                    truncated: false,
-                });
-                return Err(e);
+        let max_retries = self.retry.effective_times();
+        let mut attempt = 0usize;
+        let reply = loop {
+            match self.llm.chat(&sum_msgs, None).await {
+                Ok(r) if r.content.as_deref().unwrap_or("").trim().is_empty() && attempt < max_retries => {
+                    attempt += 1;
+                    self.emit(SessionEvent::LlmRetrying {
+                        attempt,
+                        max: max_retries,
+                        reason: "空回复（压缩模型没返回内容）".to_string(),
+                    });
+                    if self.wait_retry_backoff(attempt - 1).await {
+                        self.emit(SessionEvent::TurnFinished {
+                            text: String::new(),
+                            truncated: false,
+                        });
+                        anyhow::bail!("压缩已取消");
+                    }
+                    continue;
+                }
+                Err(e) if is_retryable_llm_error(&e) && attempt < max_retries => {
+                    attempt += 1;
+                    let reason = describe_request_error(&e);
+                    self.emit(SessionEvent::LlmRetrying {
+                        attempt,
+                        max: max_retries,
+                        reason,
+                    });
+                    if self.wait_retry_backoff(attempt - 1).await {
+                        self.emit(SessionEvent::TurnFinished {
+                            text: String::new(),
+                            truncated: false,
+                        });
+                        anyhow::bail!("压缩已取消");
+                    }
+                    continue;
+                }
+                Ok(r) => break r,
+                Err(e) => {
+                    // 失败:复位 UI 状态,保持原上下文不动
+                    self.emit(SessionEvent::TurnFinished {
+                        text: String::new(),
+                        truncated: false,
+                    });
+                    return Err(e);
+                }
             }
         };
         let summary = reply.content.unwrap_or_default();
@@ -410,7 +482,7 @@ impl Session {
                 text: String::new(),
                 truncated: false,
             });
-            anyhow::bail!("压缩模型没返回内容,再试一次");
+            anyhow::bail!("压缩模型没返回内容(已耗尽弱网重试次数，再试一次)");
         }
         let summary_msg = ChatMessage::user(format!(
             "【上下文摘要:压缩自此前 {removed} 条消息,由模型自动生成,细节以历史文件为准】\n{summary}"
@@ -817,43 +889,95 @@ impl Session {
                 used,
                 limit: if budget == usize::MAX { 0 } else { budget },
             });
-            let reply = if self.events.is_some() {
-                let ev = self.events.clone();
-                let cancel = self.cancel.clone();
-                let mut content_buf = String::new();
-                let mut reasoning_buf = String::new();
-                // 回调先绑定再传 `&mut`(直接写 `&mut |evt| …` 是临时值,活不过 select!)
-                let mut on_event = |evt: StreamEvent| match evt {
-                    StreamEvent::TextDelta(t) => {
-                        content_buf.push_str(&t);
-                        if let Some(tx) = &ev {
-                            let _ = tx.send(SessionEvent::TextDelta(t));
+            // 弱网重试：单次模型调用级。空回复/可重试错误按次数重调（统一退避），
+            // 不消耗 max_turns 轮预算；中间失败不落历史/不计 usage，只保留最终一次。
+            let max_retries = self.retry.effective_times();
+            let mut attempt = 0usize;
+            let reply = loop {
+                let single: anyhow::Result<AssistantReply> = if self.events.is_some() {
+                    let ev = self.events.clone();
+                    let cancel = self.cancel.clone();
+                    let mut content_buf = String::new();
+                    let mut reasoning_buf = String::new();
+                    // 回调先绑定再传 `&mut`(直接写 `&mut |evt| …` 是临时值,活不过 select!)
+                    let mut on_event = |evt: StreamEvent| match evt {
+                        StreamEvent::TextDelta(t) => {
+                            content_buf.push_str(&t);
+                            if let Some(tx) = &ev {
+                                let _ = tx.send(SessionEvent::TextDelta(t));
+                            }
                         }
-                    }
-                    StreamEvent::ReasoningDelta(t) => {
-                        reasoning_buf.push_str(&t);
-                        if let Some(tx) = &ev {
-                            let _ = tx.send(SessionEvent::ReasoningDelta(t));
+                        StreamEvent::ReasoningDelta(t) => {
+                            reasoning_buf.push_str(&t);
+                            if let Some(tx) = &ev {
+                                let _ = tx.send(SessionEvent::ReasoningDelta(t));
+                            }
                         }
-                    }
+                    };
+                    let result = tokio::select! {
+                        r = self.llm.chat_stream(&self.messages, Some(&defs), &mut on_event) => r,
+                        _ = cancel.cancelled() => {
+                            let text = if content_buf.is_empty() { None } else { Some(content_buf.clone()) };
+                            let r = AssistantReply { content: text, reasoning_content: None, tool_calls: vec![], usage: Default::default() };
+                            self.record(&finalize_assistant(r, true));
+                            let text = format!(
+                                "⏹ 生成已中断{}",
+                                if reasoning_buf.is_empty() { "" } else { "(已有部分思考,未输出正文)" }
+                            );
+                            self.emit(SessionEvent::TurnFinished { text: text.clone(), truncated: true });
+                            return Ok(TurnResult { text, tool_calls, truncated: true, input_tokens: usage_in, output_tokens: usage_out });
+                        }
+                    };
+                    result
+                } else {
+                    self.llm.chat(&self.messages, Some(&defs)).await
                 };
-                let result = tokio::select! {
-                    r = self.llm.chat_stream(&self.messages, Some(&defs), &mut on_event) => r,
-                    _ = cancel.cancelled() => {
-                        let text = if content_buf.is_empty() { None } else { Some(content_buf.clone()) };
-                        let r = AssistantReply { content: text, reasoning_content: None, tool_calls: vec![], usage: Default::default() };
-                        self.record(&finalize_assistant(r, true));
-                        let text = format!(
-                            "⏹ 生成已中断{}",
-                            if reasoning_buf.is_empty() { "" } else { "(已有部分思考,未输出正文)" }
-                        );
-                        self.emit(SessionEvent::TurnFinished { text: text.clone(), truncated: true });
-                        return Ok(TurnResult { text, tool_calls, truncated: true, input_tokens: usage_in, output_tokens: usage_out });
+                match single {
+                    Ok(r) if is_empty_reply(&r) && attempt < max_retries => {
+                        attempt += 1;
+                        let reason = "空回复（模型无文本输出）".to_string();
+                        self.emit(SessionEvent::LlmRetrying {
+                            attempt,
+                            max: max_retries,
+                            reason,
+                        });
+                        if self.wait_retry_backoff(attempt - 1).await {
+                            let text = "⏹ 生成已中断".to_string();
+                            self.emit(SessionEvent::TurnFinished { text: text.clone(), truncated: true });
+                            return Ok(TurnResult {
+                                text,
+                                tool_calls,
+                                truncated: true,
+                                input_tokens: usage_in,
+                                output_tokens: usage_out,
+                            });
+                        }
+                        continue;
                     }
-                };
-                result?
-            } else {
-                self.llm.chat(&self.messages, Some(&defs)).await?
+                    Err(e) if is_retryable_llm_error(&e) && attempt < max_retries => {
+                        attempt += 1;
+                        let reason = describe_request_error(&e);
+                        self.emit(SessionEvent::LlmRetrying {
+                            attempt,
+                            max: max_retries,
+                            reason,
+                        });
+                        if self.wait_retry_backoff(attempt - 1).await {
+                            let text = "⏹ 生成已中断".to_string();
+                            self.emit(SessionEvent::TurnFinished { text: text.clone(), truncated: true });
+                            return Ok(TurnResult {
+                                text,
+                                tool_calls,
+                                truncated: true,
+                                input_tokens: usage_in,
+                                output_tokens: usage_out,
+                            });
+                        }
+                        continue;
+                    }
+                    Ok(r) => break r,
+                    Err(e) => return Err(e),
+                }
             };
 
             let has_tools = !reply.tool_calls.is_empty();
@@ -1305,6 +1429,48 @@ pub fn describe_request_error(err: &anyhow::Error) -> String {
             msg
         }
     }
+}
+
+/// 弱网重试判定：空回复 = 无工具调用且正文/思考均缺失或纯空白。
+/// 纯工具调用（无正文）是合法回复，不算空。
+pub fn is_empty_reply(reply: &AssistantReply) -> bool {
+    if !reply.tool_calls.is_empty() {
+        return false;
+    }
+    let c = reply.content.as_deref().unwrap_or("").trim();
+    let r = reply.reasoning_content.as_deref().unwrap_or("").trim();
+    c.is_empty() && r.is_empty()
+}
+
+/// 弱网重试判定：该错误是否值得重试。
+/// 重试：连接失败/超时/响应中断、429、500/502/503/504。
+/// 不重试：400/401/403/404、参数错误、截断(length)、用户取消。
+pub fn is_retryable_llm_error(err: &anyhow::Error) -> bool {
+    if let Some(re) = err.chain().find_map(|c| c.downcast_ref::<reqwest::Error>()) {
+        if re.is_connect() || re.is_timeout() || re.is_body() {
+            return true;
+        }
+    }
+    let msg = format!("{err:#}");
+    if msg.contains("429") {
+        return true;
+    }
+    for code in ["500", "502", "503", "504"] {
+        if msg.contains(code) {
+            return true;
+        }
+    }
+    false
+}
+
+/// 统一退避：delay = 800ms * 2^attempt + 0~199ms 抖动（attempt 从 0 起）。
+fn retry_backoff_ms(attempt: usize) -> u64 {
+    let base = crate::config::RETRY_BACKOFF_BASE_MS.saturating_mul(1u64 << attempt.min(4));
+    let jitter = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| (d.subsec_nanos() % 200) as u64)
+        .unwrap_or(0);
+    base.saturating_add(jitter)
 }
 
 /// 组 `skill` 工具定义:单一入口 + enum 可用列表,上下文不随技能数膨胀、
@@ -2064,5 +2230,90 @@ mod tests {
             msgs.iter().all(|m| m.role != Role::Tool),
             "无主 tool 消息应被丢弃"
         );
+    }
+
+    #[test]
+    fn empty_reply_detection() {
+        use super::is_empty_reply;
+        use crate::llm::openai::AssistantReply;
+        // 全空 / 纯空白 → 空
+        assert!(is_empty_reply(&AssistantReply {
+            content: None,
+            reasoning_content: None,
+            tool_calls: vec![],
+            usage: Default::default(),
+        }));
+        assert!(is_empty_reply(&AssistantReply {
+            content: Some("   \n ".into()),
+            reasoning_content: None,
+            tool_calls: vec![],
+            usage: Default::default(),
+        }));
+        // 有正文 / 有思考 → 非空
+        assert!(!is_empty_reply(&AssistantReply {
+            content: Some("ok".into()),
+            reasoning_content: None,
+            tool_calls: vec![],
+            usage: Default::default(),
+        }));
+        assert!(!is_empty_reply(&AssistantReply {
+            content: None,
+            reasoning_content: Some("思考中".into()),
+            tool_calls: vec![],
+            usage: Default::default(),
+        }));
+        // 纯工具调用(无正文)是合法回复 → 非空
+        assert!(!is_empty_reply(&AssistantReply {
+            content: None,
+            reasoning_content: None,
+            tool_calls: vec![crate::llm::types::ToolCall {
+                id: "c1".into(),
+                call_type: "function".into(),
+                function: crate::llm::types::FunctionCall {
+                    name: "read_file".into(),
+                    arguments: "{}".into(),
+                },
+            }],
+            usage: Default::default(),
+        }));
+    }
+
+    #[test]
+    fn retryable_error_classification() {
+        use super::is_retryable_llm_error;
+        // 429 / 5xx → 重试
+        for msg in [
+            "模型端点返回 429 Too Many Requests: 限流",
+            "模型端点返回 500 Internal Server Error: 熔断",
+            "模型端点返回 503 Service Unavailable: 过载",
+        ] {
+            assert!(
+                is_retryable_llm_error(&anyhow::anyhow!("{msg}")),
+                "应重试: {msg}"
+            );
+        }
+        // 400/401/截断 → 不重试
+        for msg in [
+            "模型端点返回 400 Bad Request: 参数错误",
+            "模型端点返回 401 Unauthorized: key 无效",
+            "模型输出超过上下文长度被截断(length)",
+        ] {
+            assert!(
+                !is_retryable_llm_error(&anyhow::anyhow!("{msg}")),
+                "不应重试: {msg}"
+            );
+        }
+    }
+
+    #[test]
+    fn retry_backoff_grows() {
+        use super::retry_backoff_ms;
+        // 统一退避单调递增(抖动 200ms 内不影响量级)：800 < 1600 < 3200
+        let b0 = retry_backoff_ms(0);
+        let b1 = retry_backoff_ms(1);
+        let b2 = retry_backoff_ms(2);
+        assert!((800..1000).contains(&b0), "b0={b0}");
+        assert!((1600..1800).contains(&b1), "b1={b1}");
+        assert!((3200..3400).contains(&b2), "b2={b2}");
     }
 }

@@ -175,6 +175,7 @@ fn test_cfg(base: String, protocol: ProtocolKind, enabled: bool) -> Resolved {
         context_window: None,
         protocol,
         session_header_enabled: enabled,
+        retry: znaide_core::config::RetryConfig::disabled(),
     }
 }
 
