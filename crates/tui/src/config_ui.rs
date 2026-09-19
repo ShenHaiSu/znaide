@@ -281,30 +281,17 @@ impl SetupWizard {
 
     /// 轮数上限的展示文案
     pub fn max_turns_label(&self) -> String {
-        match self.max_turns {
-            None => format!("默认({} 轮)", znaide_core::session::DEFAULT_MAX_TURNS),
-            Some(0) => "不限".to_string(),
-            Some(n) => format!("{n} 轮"),
-        }
+        max_turns_text(self.max_turns)
     }
 
     /// 弱网重试的展示文案
     pub fn retry_label(&self) -> String {
-        if !self.retry.enabled {
-            "关闭".to_string()
-        } else {
-            format!("开启(失败后追加 {} 次)", self.retry.max_retries)
-        }
+        retry_text(&self.retry)
     }
 
     /// 上下文窗口的展示文案:自动 = 按模型名查内置表(查不到就只说绝对量)
     pub fn context_window_label(&self) -> String {
-        match self.context_window {
-            None => "自动(按模型名匹配内置表;认不出就只报绝对量)".to_string(),
-            Some(n) if n >= 1_000_000 => format!("{n}(约 {}M)", n / 1_000_000),
-            Some(n) if n >= 1_000 => format!("{n}(约 {}k)", n / 1_000),
-            Some(n) => format!("{n}"),
-        }
+        context_window_text(self.context_window)
     }
 
     /// 模型列表的滚动窗口:返回(起点下标, 画几行),保证 `model_cursor` 总在窗口内
@@ -1373,7 +1360,8 @@ impl SetupWizard {
 }
 
 /// 可用服务商列表:(名称, 端点, 默认模型)
-fn provider_list() -> Vec<(String, String, String)> {
+/// need03 复用:quick_cfg 菜单/provider 编辑共用同一份清单。
+pub(crate) fn provider_list() -> Vec<(String, String, String)> {
     let cfg = Config::load().unwrap_or_default();
     let mut out: Vec<(String, String, String)> = cfg
         .list_providers()
@@ -1383,6 +1371,90 @@ fn provider_list() -> Vec<(String, String, String)> {
     // 追加"自定义服务商"选项
     out.push(("custom".into(), "(手动输入端点)".into(), String::new()));
     out
+}
+
+/// need03 复用(与 SetupWizard::max_turns_label 同文案,供 quick_cfg 调用)。
+pub(crate) fn max_turns_text(max_turns: Option<usize>) -> String {
+    match max_turns {
+        None => format!("默认({} 轮)", znaide_core::session::DEFAULT_MAX_TURNS),
+        Some(0) => "不限".to_string(),
+        Some(n) => format!("{n} 轮"),
+    }
+}
+
+/// need03 复用(与 SetupWizard::retry_label 同文案)。
+pub(crate) fn retry_text(retry: &RetryConfig) -> String {
+    if !retry.enabled {
+        "关闭".to_string()
+    } else {
+        format!("开启(失败后追加 {} 次)", retry.max_retries)
+    }
+}
+
+/// need03 复用(与 SetupWizard::context_window_label 同文案)。
+pub(crate) fn context_window_text(w: Option<usize>) -> String {
+    match w {
+        None => "自动(按模型名匹配内置表;认不出就只报绝对量)".to_string(),
+        Some(n) if n >= 1_000_000 => format!("{n}(约 {}M)", n / 1_000_000),
+        Some(n) if n >= 1_000 => format!("{n}(约 {}k)", n / 1_000),
+        Some(n) => format!("{n}"),
+    }
+}
+
+/// need03 复用:重试档位游标→RetryConfig(0=关/1=3/2=5/3=8;4=手动保持 None)。
+/// 与 SetupWizard::apply_retry_cursor 同映射。
+pub(crate) fn retry_from_cursor(cursor: usize) -> Option<RetryConfig> {
+    match cursor {
+        0 => Some(RetryConfig::disabled()),
+        1 => Some(RetryConfig::enabled_with(3)),
+        2 => Some(RetryConfig::enabled_with(5)),
+        3 => Some(RetryConfig::enabled_with(8)),
+        _ => None,
+    }
+}
+
+/// need03 复用:数字输入解析(与 SetupWizard::confirm_typed 三路分支同语义)。
+/// 上下文窗口:空=None(自动);正整数=Some;0/非数字=Err(回填重输)。
+pub(crate) fn parse_context_window_input(t: &str) -> Result<Option<usize>, &'static str> {
+    let t = t.trim();
+    if t.is_empty() {
+        return Ok(None);
+    }
+    match t.parse::<usize>() {
+        Ok(n) if n > 0 => Ok(Some(n)),
+        _ => Err("窗口要填正整数 tokens(留空 = 自动识别),请重新输入:"),
+    }
+}
+
+/// 轮数上限:空=None(默认);0=不限;正整数=Some;非数字=Err。
+pub(crate) fn parse_max_turns_input(t: &str) -> Result<Option<usize>, &'static str> {
+    let t = t.trim();
+    if t.is_empty() {
+        return Ok(None);
+    }
+    match t.parse::<usize>() {
+        Ok(n) => Ok(Some(n)),
+        Err(_) => Err("轮数上限要填整数(0 = 不限,留空 = 默认),请重新输入:"),
+    }
+}
+
+/// 弱网重试:空/0=关闭;1..=8 开启(超限夹取 8);非数字=Err。
+pub(crate) fn parse_retry_input(t: &str) -> Result<RetryConfig, &'static str> {
+    let t = t.trim();
+    if t.is_empty() {
+        return Ok(RetryConfig::disabled());
+    }
+    match t.parse::<usize>() {
+        Ok(0) => Ok(RetryConfig::disabled()),
+        Ok(n) => Ok(RetryConfig::enabled_with(n)),
+        Err(_) => Err("重试次数要填 0..=8 的整数(空 = 关闭)，请重新输入:"),
+    }
+}
+
+/// 端点校验(与 confirm_typed custom 分支同口径)。
+pub(crate) fn valid_base_url(v: &str) -> bool {
+    let v = v.trim();
+    !v.is_empty() && (v.starts_with("http://") || v.starts_with("https://"))
 }
 
 #[cfg(test)]

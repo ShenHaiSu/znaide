@@ -1,4 +1,5 @@
 use crate::config_ui::{SetupWizard, WizardAction};
+use crate::quick_cfg::{parse_qc_alias, QcItem, QuickCfgAction, QuickCfgPanel, QcStep};
 use crate::sessions_ui::{SessionsUi, UiAction};
 use crossterm::event::{self, Event, KeyCode, KeyEventKind, KeyModifiers};
 use crossterm::execute;
@@ -278,6 +279,121 @@ fn effective_max_turns(cli_override: Option<usize>) -> usize {
     })
 }
 
+/// need03:按需直改落盘(只写目标字段,不调全量 `save()`)。
+/// 成功返回附加提示(06 §2 的 CLI/ENV 覆盖诚实提示);失败返回原因(面板停留,不落盘)。
+fn quick_cfg_save(
+    panel: &QuickCfgPanel,
+    item: QcItem,
+    fallback_provider: &str,
+    cli_max_turns: Option<usize>,
+) -> anyhow::Result<String> {
+    let mut cfg = znaide_core::config::Config::load().unwrap_or_default();
+    let provider = if panel.provider.is_empty() {
+        fallback_provider
+    } else {
+        &panel.provider
+    };
+    if provider.is_empty() {
+        anyhow::bail!("先选服务商(菜单第 1 项),再改其他项。");
+    }
+    let mut extra = String::new();
+    match item {
+        QcItem::Provider => {
+            cfg.switch_provider(provider)?;
+            extra = "可在菜单继续微调该家字段,建议跑一次验证。".into();
+        }
+        QcItem::Model => {
+            if panel.model.trim().is_empty() {
+                anyhow::bail!("模型名为空,先选一个或按 m 手输。");
+            }
+            cfg.save_model(provider, panel.model.trim())?;
+        }
+        QcItem::Protocol => {
+            cfg.save_protocol(provider, panel.protocol)?;
+        }
+        QcItem::ApiKey => {
+            // env 家未手输 → None=不动(不把环境变量值落盘,04 §4 守卫)
+            let key_arg: Option<&str> = if panel.key_from_env {
+                None
+            } else {
+                Some(&panel.api_key)
+            };
+            cfg.save_api_key(provider, key_arg)?;
+            if panel.key_from_env {
+                extra = "(仍走环境变量,未落盘)".into();
+            }
+        }
+        QcItem::BaseUrl => {
+            cfg.save_base_url(provider, &panel.base_url)?;
+        }
+        QcItem::ContextWindow => {
+            cfg.save_context_window(provider, panel.context_window)?;
+        }
+        QcItem::MaxTurns => {
+            cfg.save_max_turns(panel.max_turns)?;
+            // CLI --max-turns 仍优先:文件存了但本次运行没生效,必须明说(06 §2)
+            if cli_max_turns.is_some() {
+                extra = "(当前轮数上限被命令行参数覆盖,配置文件已存但本次运行仍以命令行值为准)".into();
+            }
+        }
+        QcItem::Retry => {
+            cfg.save_retry(panel.retry)?;
+            // ENV/CLI 覆盖重试时同样诚实提示(TUI 侧能检测到 ENV,CLI 值未传入则不提)
+            let env_hit = ["ZNAIDE_NO_RETRY", "ZNAIDE_RETRY"].iter().any(|n| {
+                std::env::var(n)
+                    .map(|v| !v.trim().is_empty())
+                    .unwrap_or(false)
+            });
+            if env_hit {
+                extra = "(当前重试被环境变量覆盖,配置文件已存但本次运行仍以环境变量为准)".into();
+            }
+        }
+        QcItem::SessionHeader => {
+            cfg.save_session_header(provider, panel.session_header)?;
+        }
+    }
+    Ok(extra)
+}
+
+/// need03:保存后生效四件套(06 §1,与 `/config` 全向导同口径):
+/// 读最新文件 resolve → Reconfigure → 刷 round_limit/ctx_window/current_resolved。
+/// `verified` 决定 Notice 是"验证通过"还是"未验证"口径。
+#[allow(clippy::too_many_arguments)]
+fn quick_cfg_apply_saved(
+    cmd_tx: &mpsc::UnboundedSender<AgentCmd>,
+    current_resolved: &mut Resolved,
+    ctx_window: &mut Option<usize>,
+    round_limit: &mut usize,
+    configured_ok: &mut bool,
+    items: &mut Vec<MsgItem>,
+    cli_max_turns: Option<usize>,
+    headline: &str,
+) {
+    let Ok(cfg) = znaide_core::config::Config::load() else {
+        items.push(MsgItem::Notice("⚠ 配置文件刚写入却读不回来,请检查磁盘权限。".into()));
+        return;
+    };
+    let Ok(draft) = cfg.resolve(None, None, None, None, None, None) else {
+        items.push(MsgItem::Notice("⚠ 配置已存但解析失败(模型/端点缺失?),请检查。".into()));
+        return;
+    };
+    // 协议变了 → 沿用全向导 proto_note 文案(06 §3)
+    let proto_note = if current_resolved.protocol != draft.protocol {
+        format!(
+            "协议已切换为 {}，历史继续有效；若模型表现异常可 /clear 开新上下文。",
+            draft.protocol.as_str()
+        )
+    } else {
+        String::new()
+    };
+    *round_limit = effective_max_turns(cli_max_turns);
+    let _ = cmd_tx.send(AgentCmd::Reconfigure(draft.clone()));
+    *current_resolved = draft.clone();
+    *ctx_window = current_resolved.effective_context_window();
+    *configured_ok = true;
+    items.push(MsgItem::Notice(format!("✔ {headline}{proto_note}")));
+}
+
 /// 交互主循环。resume = `--resume` 指定的历史会话文件;
 /// persona = 启动时注入的全局人格(空 = 不注入)。
 /// max_turns = 命令行 `--max-turns` 覆盖(None = 用 config/默认)。
@@ -410,6 +526,9 @@ pub async fn run(
                         // 命令行给了 --max-turns 的话仍然它优先)。
                         // 状态栏的 round_limit 由宿主在保存配置处同步(这里在 agent 任务里,拿不到 UI 变量)
                         session.set_max_turns(effective_max_turns(max_turns));
+                        // 弱网重试同样即时跟上(/cfg 改 retry 立即生效;06 §1)。
+                        // TUI 侧无 CLI retry 值,用文件值(与全向导 draft 同口径)。
+                        session.set_retry(r.retry);
                         session.notify(format!(
                             "✔ 配置已切换: {} / {}",
                             r.provider_name, r.model
@@ -515,6 +634,8 @@ pub async fn run(
     let mut session_id = String::new();
     // 配置向导(None = 对话模式)
     let mut config_wizard: Option<SetupWizard> = None;
+    // 按需直改面板(/cfg;None = 对话模式;与 config_wizard 互斥,同一时刻最多一个)
+    let mut quick_cfg: Option<QuickCfgPanel> = None;
     // 会话管理窗口(/resume 无参打开;None = 对话模式)
     let mut sessions_ui: Option<SessionsUi> = None;
     // 配置向导异步回传通道
@@ -624,6 +745,19 @@ pub async fn run(
                         height: avail_bottom.saturating_sub(avail_top).max(1),
                     };
                     wizard.render(f, inner);
+                    return;
+                }
+                // 按需直改面板(/cfg):同样覆盖消息+输入+状态区
+                if let Some(qc) = &quick_cfg {
+                    let avail_top = chunks[1].y;
+                    let avail_bottom = chunks[3].y; // 状态栏 y
+                    let inner = Rect {
+                        x: chunks[1].x,
+                        y: avail_top,
+                        width: chunks[1].width,
+                        height: avail_bottom.saturating_sub(avail_top).max(1),
+                    };
+                    qc.render(f, inner);
                     return;
                 }
                 // 会话管理窗口:同样覆盖消息+输入+状态区
@@ -859,14 +993,21 @@ pub async fn run(
             // 兼容 \r\n 与 \r;再剥离终端控制/转义残留(鼠标残片防线)
             let norm = text.replace("\r\n", "\n").replace('\r', "\n");
             let clean = sanitize_typed_text(&norm);
-            if config_wizard.is_none() && permission.is_none() && confirm.is_none() {
+            if config_wizard.is_none()
+                && quick_cfg.is_none()
+                && permission.is_none()
+                && confirm.is_none()
+            {
                 input_cursor = insert_str_at(&mut input, input_cursor, &clean);
             } else if permission.is_none() && confirm.is_none() {
-                // 配置向导的文本输入态(API Key / 端点 / 模型名 / 轮数)允许粘贴:
+                // 配置向导/按需面板的文本输入态(API Key / 端点 / 模型名 / 轮数)允许粘贴:
                 // 只填进输入缓冲,**不当作回车**(不提交、不推进步骤)。
                 // 权限确认与破坏性确认弹窗是 y/n 决策,粘贴仍忽略(防多行粘贴误触发)。
                 if let Some(w) = config_wizard.as_mut() {
                     let _ = w.paste_text(&clean);
+                }
+                if let Some(q) = quick_cfg.as_mut() {
+                    let _ = q.paste_text(&clean);
                 }
             }
         }
@@ -1014,6 +1155,71 @@ pub async fn run(
                 }
                 continue;
             }
+            // 按需直改面板(/cfg):按键交面板,保存/验证由宿主执行(与全向导对称)
+            if let Some(mut qc) = quick_cfg.take() {
+                let action = qc.on_key(k);
+                match action {
+                    QuickCfgAction::None => {
+                        quick_cfg = Some(qc);
+                    }
+                    QuickCfgAction::Exit => {
+                        items.push(MsgItem::Notice(
+                            "已关闭按需配置(随时 /cfg 再开)。".into(),
+                        ));
+                    }
+                    QuickCfgAction::FetchModels {
+                        base_url,
+                        api_key,
+                        session_header,
+                    } => {
+                        quick_cfg = Some(qc);
+                        let tx = wiz_tx.clone();
+                        tokio::spawn(async move {
+                            let r = znaide_core::llm::openai::probe_models(
+                                &base_url,
+                                api_key.as_deref(),
+                                session_header.as_deref(),
+                            )
+                            .await;
+                            let _ = tx.send(WizardReply::Models(r.map_err(|e| format!("{e:#}"))));
+                        });
+                    }
+                    QuickCfgAction::Verify(draft) => {
+                        quick_cfg = Some(qc);
+                        let tx = wiz_tx.clone();
+                        tokio::spawn(async move {
+                            let r = znaide_core::llm::openai::probe_chat(&draft).await;
+                            let _ = tx.send(WizardReply::Verify(r.map_err(|e| format!("{e:#}"))));
+                        });
+                    }
+                    QuickCfgAction::Save(item) => {
+                        // 直接提交:只写目标字段 + 生效四件套,全程不联网
+                        match quick_cfg_save(&qc, item, &current_resolved.provider_name, max_turns)
+                        {
+                            Ok(extra) => {
+                                quick_cfg_apply_saved(
+                                    &cmd_tx,
+                                    &mut current_resolved,
+                                    &mut ctx_window,
+                                    &mut round_limit,
+                                    &mut configured_ok,
+                                    &mut items,
+                                    max_turns,
+                                    &format!("{}已保存并生效。{extra}", item.title()),
+                                );
+                                qc.inject_saved(item, extra);
+                                quick_cfg = Some(qc);
+                            }
+                            Err(e) => {
+                                // 校验失败:停留编辑态,不落盘不生效
+                                qc.notice = format!("{e}");
+                                quick_cfg = Some(qc);
+                            }
+                        }
+                    }
+                }
+                continue;
+            }
             // 会话管理窗口模式:按键交给窗口,动作由宿主执行
             if let Some(mut su) = sessions_ui.take() {
                 match su.on_key(k) {
@@ -1072,13 +1278,66 @@ pub async fn run(
                         continue;
                     }
                     if raw == "/config" {
-                        items.push(MsgItem::Notice("打开配置向导…".into()));
+                        // /config 无参:全量向导,行为零变化(03 §5 互斥:先关按需面板)
+                        if quick_cfg.take().is_some() {
+                            items.push(MsgItem::Notice(
+                                "已关闭按需配置(编辑未保存),打开全量向导…".into(),
+                            ));
+                        } else {
+                            items.push(MsgItem::Notice("打开配置向导…".into()));
+                        }
                         let mut w = SetupWizard::new();
                         // 预填现有轮数上限(其余字段在向导里现选/现填)
                         w.prefill();
                         config_wizard = Some(w);
                         input.clear();
                         input_cursor = 0;
+                    } else if raw == "/cfg"
+                        || raw.starts_with("/cfg ")
+                        || raw.starts_with("/config ")
+                    {
+                        // need03:按需直改面板。/cfg[/cfg <子项>] 与 /config <子项> 进同一面板;
+                        // /config 无参仍走全向导。首次运行(无可用配置)拒绝进入,指引 /config。
+                        if config_wizard.take().is_some() {
+                            items.push(MsgItem::Notice(
+                                "已关闭全量向导(编辑未保存),打开按需配置…".into(),
+                            ));
+                        }
+                        if !configured_ok {
+                            items.push(MsgItem::Notice(
+                                "⚠ 还没有任何可用配置,先用 /config 完成一次初始化,再用 /cfg 按需改。"
+                                    .into(),
+                            ));
+                            input.clear();
+                            input_cursor = 0;
+                        } else {
+                            let arg = if raw == "/cfg" {
+                                String::new()
+                            } else if let Some(a) = raw.strip_prefix("/cfg ") {
+                                a.to_string()
+                            } else {
+                                raw.strip_prefix("/config ").unwrap_or("").to_string()
+                            };
+                            let arg = arg.trim().to_string();
+                            if arg.is_empty() {
+                                quick_cfg = Some(QuickCfgPanel::open_menu());
+                                items.push(MsgItem::Notice("打开按需配置…".into()));
+                            } else if let Some(item) = parse_qc_alias(&arg) {
+                                quick_cfg = Some(QuickCfgPanel::open_with(item));
+                                items.push(MsgItem::Notice(format!(
+                                    "打开按需配置:{}(s 直接提交 / v 验证后提交)…",
+                                    item.title()
+                                )));
+                            } else {
+                                let mut p = QuickCfgPanel::open_menu();
+                                p.notice =
+                                    format!("未知子项 {arg},请从菜单选择。");
+                                quick_cfg = Some(p);
+                                items.push(MsgItem::Notice("打开按需配置…".into()));
+                            }
+                            input.clear();
+                            input_cursor = 0;
+                        }
                     } else if raw.starts_with('/') {
                         match handle_command(
                             &raw,
@@ -1215,12 +1474,57 @@ pub async fn run(
         loop {
             match wiz_rx.try_recv() {
                 Ok(WizardReply::Models(r)) => {
-                    if let Some(w) = &mut config_wizard {
+                    // 按需面板与全向导互斥:谁在谁吃
+                    if let Some(q) = &mut quick_cfg {
+                        q.inject_models(r);
+                    } else if let Some(w) = &mut config_wizard {
                         w.inject_models(r);
                     }
                 }
                 Ok(WizardReply::Verify(r)) => {
-                    if let Some(w) = &mut config_wizard {
+                    // 按需面板 Verifying 态优先:成功才落盘+生效,失败停留可重试(02 §4)
+                    let qc_verifying = match &quick_cfg {
+                        Some(q) => match q.step {
+                            QcStep::Verifying { item } => Some(item),
+                            _ => None,
+                        },
+                        None => None,
+                    };
+                    if let (Some(item), Some(q)) = (qc_verifying, &mut quick_cfg) {
+                        match r {
+                            Ok(()) => {
+                                match quick_cfg_save(
+                                    q,
+                                    item,
+                                    &current_resolved.provider_name,
+                                    max_turns,
+                                ) {
+                                    Ok(extra) => {
+                                        quick_cfg_apply_saved(
+                                            &cmd_tx,
+                                            &mut current_resolved,
+                                            &mut ctx_window,
+                                            &mut round_limit,
+                                            &mut configured_ok,
+                                            &mut items,
+                                            max_turns,
+                                            &format!(
+                                                "验证通过:{}已保存并生效。{extra}",
+                                                item.title()
+                                            ),
+                                        );
+                                        q.inject_verify_ok(item, extra);
+                                    }
+                                    Err(e) => {
+                                        q.inject_verify_err(item, format!("落盘失败:{e}"));
+                                    }
+                                }
+                            }
+                            Err(e) => {
+                                q.inject_verify_err(item, e);
+                            }
+                        }
+                    } else if let Some(w) = &mut config_wizard {
                         match r {
                             Ok(()) => {
                                 // 验证通过 → 保存并解锁
@@ -1345,6 +1649,7 @@ pub async fn run(
         let modal = permission.is_some()
             || confirm.is_some()
             || config_wizard.is_some()
+            || quick_cfg.is_some()
             || sessions_ui.is_some();
         if let Some(next) = queue.pop_ready(!busy, modal) {
             items.push(MsgItem::User(next.clone()));
@@ -1355,8 +1660,11 @@ pub async fn run(
         }
         // 输入补全刷新:基于最新 input/光标;前缀与位置未变时保留选中,不做磁盘 IO。
         // 向导/确认框/工作中时不触发(相关层已拦截按键,这里兜底清空状态)。
-        let completable =
-            !busy && permission.is_none() && confirm.is_none() && config_wizard.is_none();
+        let completable = !busy
+            && permission.is_none()
+            && confirm.is_none()
+            && config_wizard.is_none()
+            && quick_cfg.is_none();
         refresh_completion(&input, input_cursor, cwd, completable, &mut completion);
         // 上下文占用警示:空闲时 >=90% 提示一次(可 /compact 或开新会话);回落后重新武装。
         // 窗口未知不提示(宁可不说,也不拿猜出来的窗口劝人做没必要的压缩);
@@ -1770,6 +2078,7 @@ const HELP_TEXT: &str = "可用命令:
   /help                    显示本帮助
   /skills                  列出已安装技能
   /config                  打开配置面板(随时修改 provider/模型/端点/key/轮数上限,立即生效)
+  /cfg                     按需改配置(选一项改一项,可直接提交/验证后提交;/cfg <子项> 直达)
   /undo                    列出 undo 快照; /undo <序号> 回滚
   /resume                  打开会话管理窗口(会话/记忆页签,多选批量删、备注、恢复); /resume <序号|片段> 恢复; /resume del <序号|片段> 删除
   /clear                   清空当前会话上下文与历史文件(需确认)
@@ -2367,6 +2676,7 @@ const SLASH_BUILTINS: &[(&str, &str)] = &[
     ("/help", "显示帮助"),
     ("/skills", "已安装技能列表"),
     ("/config", "打开配置向导"),
+    ("/cfg", "按需改配置(选一项改一项,可直接提交/验证后提交)"),
     ("/undo", "undo 快照/回滚(/undo <序号>)"),
     (
         "/resume",

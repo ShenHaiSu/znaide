@@ -605,6 +605,95 @@ impl Config {
         self.persist()
     }
 
+    /// 按需直改(/cfg):只动目标字段,不碰全量 `save()` 的"重写整个条目+清空顶层"语义。
+    /// 以下方法统一:ensure_build_tag → 改目标字段 → persist。`config.json` 零迁移。
+    /// 弱网重试(顶层 retry)。超限夹取 MAX_RETRIES(与 resolve/apply_config 同口径)。
+    pub fn save_retry(&mut self, retry: RetryConfig) -> anyhow::Result<()> {
+        self.ensure_build_tag();
+        let mut r = retry;
+        r.max_retries = r.max_retries.min(MAX_RETRIES);
+        self.retry = r;
+        self.persist()
+    }
+
+    /// 轮次上限(顶层 max_turns)。None=默认,Some(0)=不限。
+    pub fn save_max_turns(&mut self, max_turns: Option<usize>) -> anyhow::Result<()> {
+        self.ensure_build_tag();
+        self.max_turns = max_turns;
+        self.persist()
+    }
+
+    /// 上下文窗口(当前家 provider 条目)。None/0=自动(不固定)。
+    pub fn save_context_window(
+        &mut self,
+        provider: &str,
+        w: Option<usize>,
+    ) -> anyhow::Result<()> {
+        self.ensure_build_tag();
+        let entry = self.providers.entry(provider.to_string()).or_default();
+        entry.context_window = w.filter(|n| *n > 0);
+        self.persist()
+    }
+
+    /// API Key(当前家 provider 条目明文)。
+    /// None=不动(env 家守卫:不把环境变量值落盘);Some("")=清空明文。
+    pub fn save_api_key(
+        &mut self,
+        provider: &str,
+        key: Option<&str>,
+    ) -> anyhow::Result<()> {
+        self.ensure_build_tag();
+        if let Some(k) = key {
+            let entry = self.providers.entry(provider.to_string()).or_default();
+            entry.api_key = Some(k.to_string()).filter(|s| !s.is_empty());
+        }
+        self.persist()
+    }
+
+    /// 模型(当前家 provider 条目,不存在即建)。
+    pub fn save_model(&mut self, provider: &str, model: &str) -> anyhow::Result<()> {
+        self.ensure_build_tag();
+        let entry = self.providers.entry(provider.to_string()).or_default();
+        entry.model = Some(model.to_string());
+        self.persist()
+    }
+
+    /// 端点(当前家 provider 条目,不存在即建)。必须 http(s):// 开头。
+    pub fn save_base_url(&mut self, provider: &str, url: &str) -> anyhow::Result<()> {
+        let t = url.trim();
+        if !(t.starts_with("http://") || t.starts_with("https://")) {
+            anyhow::bail!("端点要以 http:// 或 https:// 开头");
+        }
+        self.ensure_build_tag();
+        let entry = self.providers.entry(provider.to_string()).or_default();
+        entry.base_url = Some(t.to_string());
+        self.persist()
+    }
+
+    /// 协议(当前家 provider 条目)。Chat 存 None(config.json 保持干净,老版本可读)。
+    pub fn save_protocol(&mut self, provider: &str, p: ProtocolKind) -> anyhow::Result<()> {
+        self.ensure_build_tag();
+        let entry = self.providers.entry(provider.to_string()).or_default();
+        entry.protocol = Some(p).filter(|p| *p != ProtocolKind::Chat);
+        self.persist()
+    }
+
+    /// 会话头开关(当前家 provider 条目)。
+    pub fn save_session_header(&mut self, provider: &str, on: bool) -> anyhow::Result<()> {
+        self.ensure_build_tag();
+        let entry = self.providers.entry(provider.to_string()).or_default();
+        entry.session_header = on;
+        self.persist()
+    }
+
+    /// 切换当前服务商(只换顶层指针;条目不存在则建空条目,不碰别家字段)。
+    pub fn switch_provider(&mut self, name: &str) -> anyhow::Result<()> {
+        self.ensure_build_tag();
+        self.provider = Some(name.to_string());
+        self.providers.entry(name.to_string()).or_default();
+        self.persist()
+    }
+
     /// 落盘(整份序列化写入)
     fn persist(&self) -> anyhow::Result<()> {
         let path = config_path();
@@ -1538,5 +1627,182 @@ mod tests {
         std::env::set_var("ZNAIDE_NO_RETRY", "1");
         assert_eq!(cfg.resolve_retry(None, false).effective_times(), 0);
         std::env::remove_var("ZNAIDE_NO_RETRY");
+    }
+
+    /// need03 U1:save_retry 夹取(99→8);disabled 生效 0 次
+    #[test]
+    fn quick_save_retry_clamps() {
+        assert_eq!(RetryConfig::enabled_with(99).max_retries, MAX_RETRIES);
+        assert_eq!(RetryConfig::disabled().effective_times(), 0);
+        let _g = crate::test_util::DATA_DIR_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let dir = std::env::temp_dir().join(format!("znaide_qc_u1_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::env::set_var("ZNAIDE_DATA_DIR", &dir);
+        let mut cfg = Config::default();
+        cfg.save_retry(RetryConfig::enabled_with(99)).unwrap();
+        let back = Config::load().unwrap();
+        assert!(back.retry.enabled);
+        assert_eq!(back.retry.max_retries, MAX_RETRIES);
+        assert_eq!(back.retry.effective_times(), MAX_RETRIES);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// need03 U2:save_max_turns 语义(None→默认200;Some(0)=不限;Some(5)=5)
+    #[test]
+    fn quick_save_max_turns_semantics() {
+        let _g = crate::test_util::DATA_DIR_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let dir = std::env::temp_dir().join(format!("znaide_qc_u2_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::env::set_var("ZNAIDE_DATA_DIR", &dir);
+        let mut cfg = Config::default();
+        cfg.save_max_turns(None).unwrap();
+        assert_eq!(
+            Config::load().unwrap().effective_max_turns(),
+            crate::session::DEFAULT_MAX_TURNS
+        );
+        cfg.save_max_turns(Some(0)).unwrap();
+        assert_eq!(Config::load().unwrap().effective_max_turns(), 0);
+        cfg.save_max_turns(Some(5)).unwrap();
+        assert_eq!(Config::load().unwrap().effective_max_turns(), 5);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// need03 U3:save_context_window(Some(0)→None;None→模型表;正整数直存)
+    #[test]
+    fn quick_save_context_window_semantics() {
+        let _g = crate::test_util::DATA_DIR_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let dir = std::env::temp_dir().join(format!("znaide_qc_u3_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::env::set_var("ZNAIDE_DATA_DIR", &dir);
+        let mut cfg = Config::default();
+        // 0 视为自动
+        cfg.save_context_window("ollama", Some(0)).unwrap();
+        assert_eq!(Config::load().unwrap().providers["ollama"].context_window, None);
+        // 正整数直存
+        cfg.save_context_window("ollama", Some(65536)).unwrap();
+        assert_eq!(
+            Config::load().unwrap().providers["ollama"].context_window,
+            Some(65536)
+        );
+        // None → 按模型表(qwen3:8b=40960)
+        cfg.save_context_window("ollama", None).unwrap();
+        let back = Config::load().unwrap();
+        assert_eq!(back.providers["ollama"].context_window, None);
+        let r = back.resolve(None, None, None, None, None, None).unwrap();
+        assert_eq!(r.effective_context_window(), Some(40960));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// need03 U4:save_protocol(Chat→条目None;Response→Some;parse 复数兼容)
+    #[test]
+    fn quick_save_protocol_semantics() {
+        assert_eq!(ProtocolKind::parse("RESPONSES"), Some(ProtocolKind::Response));
+        let _g = crate::test_util::DATA_DIR_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let dir = std::env::temp_dir().join(format!("znaide_qc_u4_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::env::set_var("ZNAIDE_DATA_DIR", &dir);
+        let mut cfg = Config::default();
+        cfg.save_protocol("ollama", ProtocolKind::Chat).unwrap();
+        assert_eq!(Config::load().unwrap().providers["ollama"].protocol, None);
+        cfg.save_protocol("ollama", ProtocolKind::Response).unwrap();
+        assert_eq!(
+            Config::load().unwrap().providers["ollama"].protocol,
+            Some(ProtocolKind::Response)
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// need03 U5:save_api_key(None→不动;Some("")→清空;Some(k)→明文)
+    #[test]
+    fn quick_save_api_key_semantics() {
+        let _g = crate::test_util::DATA_DIR_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let dir = std::env::temp_dir().join(format!("znaide_qc_u5_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::env::set_var("ZNAIDE_DATA_DIR", &dir);
+        let mut cfg = Config::default();
+        cfg.save_api_key("myco", Some("sk-abc")).unwrap();
+        assert_eq!(
+            Config::load().unwrap().providers["myco"].api_key.as_deref(),
+            Some("sk-abc")
+        );
+        // None=不动(env 家守卫)
+        cfg.save_api_key("myco", None).unwrap();
+        assert_eq!(
+            Config::load().unwrap().providers["myco"].api_key.as_deref(),
+            Some("sk-abc")
+        );
+        // 空串=清空明文
+        cfg.save_api_key("myco", Some("")).unwrap();
+        assert_eq!(Config::load().unwrap().providers["myco"].api_key, None);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// need03 U6:switch_provider 换指针不丢别家条目;不存在的家建空条目不 panic
+    #[test]
+    fn quick_switch_provider_keeps_other_entries() {
+        let _g = crate::test_util::DATA_DIR_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let dir = std::env::temp_dir().join(format!("znaide_qc_u6_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::env::set_var("ZNAIDE_DATA_DIR", &dir);
+        let mut cfg = Config::default();
+        cfg.save_model("houseA", "model-a").unwrap();
+        cfg.switch_provider("brand-new-house").unwrap();
+        let back = Config::load().unwrap();
+        assert_eq!(back.provider.as_deref(), Some("brand-new-house"));
+        assert_eq!(
+            back.providers["houseA"].model.as_deref(),
+            Some("model-a")
+        );
+        assert!(back.providers.contains_key("brand-new-house"));
+        // save_base_url 非法端点拒绝落盘
+        assert!(cfg.save_base_url("x", "ftp://bad").is_err());
+        cfg.save_base_url("houseA", "https://api.example.com/v1").unwrap();
+        assert_eq!(
+            Config::load().unwrap().providers["houseA"].base_url.as_deref(),
+            Some("https://api.example.com/v1")
+        );
+        // save_session_header 只动目标家
+        cfg.save_session_header("houseA", true).unwrap();
+        let back = Config::load().unwrap();
+        assert!(back.providers["houseA"].session_header);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// need03 R2 守卫:按需 save_* 不得清空顶层三件套(与全量 save() 口径隔离)
+    #[test]
+    fn quick_save_star_keeps_top_level_overrides() {
+        let _g = crate::test_util::DATA_DIR_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let dir = std::env::temp_dir().join(format!("znaide_qc_r2_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::env::set_var("ZNAIDE_DATA_DIR", &dir);
+        let mut cfg = Config::default();
+        cfg.model = Some("top-override".into());
+        cfg.persist().unwrap();
+        cfg.save_max_turns(Some(7)).unwrap();
+        let back = Config::load().unwrap();
+        assert_eq!(back.model.as_deref(), Some("top-override"));
+        assert_eq!(back.max_turns, Some(7));
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
