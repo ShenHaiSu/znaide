@@ -3,7 +3,7 @@
 
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
-use znaide_core::config::{Config, ProtocolKind, Resolved, RetryConfig};
+use znaide_core::config::{Config, EffectiveProxy, ProtocolKind, Resolved, RetryConfig};
 
 static E2E_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
@@ -101,6 +101,7 @@ fn draft_for(base: &str) -> Resolved {
         protocol: ProtocolKind::Chat,
         session_header_enabled: false,
         retry: RetryConfig::disabled(),
+        proxy: EffectiveProxy::Direct,
     }
 }
 

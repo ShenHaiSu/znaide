@@ -42,6 +42,10 @@ pub struct Config {
     /// 按次数重试(统一退避)，耗尽才算彻底失败。
     #[serde(default)]
     pub retry: RetryConfig,
+    /// 全局网络代理(默认 Auto = 跟随环境，零回归)。与 retry 同口径的顶层字段，
+    /// 不跟 provider 走；落定值随 Resolved 走全链路。
+    #[serde(default)]
+    pub proxy: ProxyConfig,
     /// 配置格式版本(内部键):保存时缺失自动补齐,供将来迁移判断。
     #[serde(default)]
     pub build_tag: Option<String>,
@@ -189,6 +193,149 @@ pub struct Resolved {
     pub session_header_enabled: bool,
     /// 弱网重试策略(resolve 时已落定，含 CLI/ENV 覆盖)
     pub retry: RetryConfig,
+    /// 本次运行的生效代理快照(resolve 时已落定文件值，CLI/ENV 覆盖由宿主覆写)
+    pub proxy: EffectiveProxy,
+}
+
+/// 全局网络代理三档(顶层 `proxy` 原文)。默认 Auto = 跟随环境，零回归。
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize)]
+pub struct ProxyConfig {
+    /// auto（默认）/ off / manual（大小写不敏感；非法 → auto 并警告）
+    pub mode: ProxyMode,
+    /// manual 档的地址；auto/off 下忽略（保存时清空，保持文件干净）
+    pub url: Option<String>,
+}
+
+/// 手写 Deserialize：`mode` 先读 String，`parse` 失败 → Auto + 警告，
+/// 避免手写 `"mode":"foo"` 炸掉整份 config 反序列化。
+impl<'de> serde::Deserialize<'de> for ProxyConfig {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        #[derive(serde::Deserialize)]
+        struct ProxyConfigRaw {
+            #[serde(default)]
+            mode: Option<String>,
+            #[serde(default)]
+            url: Option<String>,
+        }
+        let raw = ProxyConfigRaw::deserialize(deserializer)?;
+        let mode = match raw.mode.as_deref() {
+            None | Some("") => ProxyMode::Auto,
+            Some(s) => match ProxyMode::parse(s) {
+                Some(m) => m,
+                None => {
+                    eprintln!("⚠ 配置文件 proxy.mode={s:?} 无法识别(应为 auto/off/manual)，已按跟随环境处理");
+                    ProxyMode::Auto
+                }
+            },
+        };
+        Ok(ProxyConfig { mode, url: raw.url })
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ProxyMode {
+    #[default]
+    Auto,
+    Off,
+    Manual,
+}
+
+impl ProxyMode {
+    pub fn parse(s: &str) -> Option<Self> {
+        match s.trim().to_lowercase().as_str() {
+            "auto" | "env" | "follow" => Some(ProxyMode::Auto),
+            "off" | "none" | "direct" | "直连" => Some(ProxyMode::Off),
+            "manual" | "custom" | "手动" => Some(ProxyMode::Manual),
+            _ => None,
+        }
+    }
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            ProxyMode::Auto => "auto",
+            ProxyMode::Off => "off",
+            ProxyMode::Manual => "manual",
+        }
+    }
+}
+
+/// 本次运行的生效代理（快照，随 Resolved 走全链路）。
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub enum EffectiveProxy {
+    /// 直连（Off 强制 / 各层都没配出来）
+    #[default]
+    Direct,
+    /// 走该地址（含 NO_PROXY 豁免）
+    Via(String),
+}
+
+impl EffectiveProxy {
+    pub fn url(&self) -> Option<&str> {
+        match self {
+            EffectiveProxy::Direct => None,
+            EffectiveProxy::Via(u) => Some(u),
+        }
+    }
+    /// 菜单/日志展示（密码脱敏：只露 scheme://host:port）
+    pub fn display(&self) -> String {
+        match self {
+            EffectiveProxy::Direct => "直连".to_string(),
+            EffectiveProxy::Via(u) => mask_proxy_url(u),
+        }
+    }
+}
+
+/// 代理 URL 脱敏：去掉 `userinfo@` 段，scheme/host/port 原样。
+pub fn mask_proxy_url(u: &str) -> String {
+    // scheme://[userinfo@]rest → scheme://rest
+    if let Some(scheme_end) = u.find("://") {
+        let (scheme, rest) = u.split_at(scheme_end + 3);
+        if let Some(at) = rest.find('@') {
+            // '@' 之后才是 host 部分（userinfo 里不会有 '/'，先确认 '@' 在首个 '/' 之前）
+            let before_slash = rest.find('/').unwrap_or(rest.len());
+            if at < before_slash {
+                return format!("{scheme}{}", &rest[at + 1..]);
+            }
+        }
+        return u.to_string();
+    }
+    u.to_string()
+}
+
+/// 代理地址校验：scheme ∈ {http, https, socks5, socks5h} 且有 host。
+/// 返回归一后的 url（去首尾空白与尾斜杠，scheme 小写）。
+pub fn normalize_proxy_url(v: &str) -> anyhow::Result<String> {
+    let t = v.trim();
+    if t.is_empty() {
+        anyhow::bail!("代理地址要形如 http(s)://host:port 或 socks5(h)://host:port，当前是空串");
+    }
+    let scheme_end = t.find("://").ok_or_else(|| {
+        anyhow::anyhow!("代理地址要形如 http(s)://host:port 或 socks5(h)://host:port，当前是 {v:?}")
+    })?;
+    let (scheme_raw, rest) = t.split_at(scheme_end + 3);
+    let scheme = scheme_raw[..scheme_raw.len() - 3].to_lowercase();
+    if !matches!(scheme.as_str(), "http" | "https" | "socks5" | "socks5h") {
+        anyhow::bail!("代理地址要形如 http(s)://host:port 或 socks5(h)://host:port，当前是 {v:?}");
+    }
+    // rest = [userinfo@]host[:port][/...]，host 不能为空
+    let host_part = rest.split('/').next().unwrap_or("");
+    let host_part = match host_part.rfind('@') {
+        Some(i) => &host_part[i + 1..],
+        None => host_part,
+    };
+    if host_part.is_empty() {
+        anyhow::bail!("代理地址要形如 http(s)://host:port 或 socks5(h)://host:port，当前是 {v:?}");
+    }
+    let normalized = format!("{scheme}://{rest}");
+    Ok(normalized.trim_end_matches('/').to_string())
+}
+
+/// TUI 输入态轻量预检（与 confirm_typed 同口径，不抛 anyhow）。
+pub fn valid_proxy_url(v: &str) -> bool {
+    normalize_proxy_url(v).is_ok()
 }
 
 /// 模型窗口内置表(没配 context_window 时按名字匹配)。
@@ -453,6 +600,10 @@ impl Config {
         let mut retry = self.retry;
         retry.max_retries = retry.max_retries.min(MAX_RETRIES);
 
+        // 代理：resolve() 只落定文件值（含 Auto 跟随环境）；CLI/ENV 覆盖由宿主
+        // 在 resolve() 之后用 resolve_proxy() 覆写 resolved.proxy（与 retry 同路）。
+        let proxy = self.resolve_proxy(None, false);
+
         Ok(Resolved {
             model,
             base_url,
@@ -463,17 +614,66 @@ impl Config {
             protocol,
             session_header_enabled,
             retry,
+            proxy,
         })
+    }
+
+    /// 代理最终落定。优先级：CLI(--proxy/--no-proxy) > ENV(ZNAIDE_NO_PROXY/ZNAIDE_PROXY)
+    /// 文件 Off > 文件 Manual > 环境(HTTPS_PROXY…) > 直连。
+    /// 非法值警告并按“该层没设”继续（与 ZNAIDE_PROTOCOL 同口径）。
+    pub fn resolve_proxy(&self, cli_proxy: Option<String>, cli_no_proxy: bool) -> EffectiveProxy {
+        if cli_no_proxy {
+            return EffectiveProxy::Direct;
+        }
+        if let Some(u) = cli_proxy {
+            let t = u.trim();
+            if !t.is_empty() {
+                match normalize_proxy_url(t) {
+                    Ok(n) => return EffectiveProxy::Via(n),
+                    Err(e) => eprintln!("⚠ --proxy={u:?} 无效({e:#})，已忽略"),
+                }
+            }
+        }
+        if let Some(v) = env_first(&["ZNAIDE_NO_PROXY"]) {
+            if matches!(
+                v.trim().to_lowercase().as_str(),
+                "1" | "true" | "yes" | "on"
+            ) {
+                return EffectiveProxy::Direct;
+            }
+        }
+        if self.proxy.mode == ProxyMode::Off {
+            return EffectiveProxy::Direct;
+        }
+        if let Some(v) = env_first(&["ZNAIDE_PROXY"]) {
+            let t = v.trim();
+            if !t.is_empty() {
+                match normalize_proxy_url(t) {
+                    Ok(n) => return EffectiveProxy::Via(n),
+                    Err(e) => eprintln!("⚠ 环境变量 ZNAIDE_PROXY={v:?} 无效({e:#})，已忽略"),
+                }
+            }
+        }
+        if self.proxy.mode == ProxyMode::Manual {
+            match self.proxy.url.as_deref() {
+                Some(u) if !u.trim().is_empty() => match normalize_proxy_url(u) {
+                    Ok(n) => return EffectiveProxy::Via(n),
+                    Err(e) => eprintln!("⚠ 配置文件 proxy.url={u:?} 无效({e:#})，已按跟随环境处理"),
+                },
+                _ => eprintln!("⚠ 配置文件代理为 manual 但未填地址，已按跟随环境处理"),
+            }
+        }
+        // Auto：跟随环境（HTTPS_PROXY → ALL_PROXY → HTTP_PROXY，现状顺序）
+        match crate::update::env_proxy_url() {
+            Some(u) => EffectiveProxy::Via(u),
+            None => EffectiveProxy::Direct,
+        }
     }
 
     /// 弱网重试最终策略，优先级：CLI(--retry/--no-retry) > ENV > config 文件。
     /// ENV：ZNAIDE_NO_RETRY=1/true 强制关；ZNAIDE_RETRY=N(N>0 开 N 次，0 关)。
     /// 返回值已夹取 0..=MAX_RETRIES。
-    pub fn resolve_retry(
-        &self,
-        cli_retry: Option<usize>,
-        cli_no_retry: bool,
-    ) -> RetryConfig {
+    pub fn resolve_retry(&self, cli_retry: Option<usize>, cli_no_retry: bool) -> RetryConfig {
         if cli_no_retry {
             return RetryConfig::disabled();
         }
@@ -613,6 +813,26 @@ impl Config {
         let mut r = retry;
         r.max_retries = r.max_retries.min(MAX_RETRIES);
         self.retry = r;
+        self.persist()
+    }
+
+    /// 网络代理（顶层 proxy）。mode 非 manual 时 url 强制 None（文件干净）。
+    /// manual 非法地址拒绝落盘（调用方透出 anyhow 文案，面板回填重输）。
+    pub fn save_proxy(&mut self, proxy: ProxyConfig) -> anyhow::Result<()> {
+        self.ensure_build_tag();
+        let mut p = proxy;
+        p.url = p
+            .url
+            .map(|u| u.trim().to_string())
+            .filter(|u| !u.is_empty());
+        if p.mode != ProxyMode::Manual {
+            p.url = None;
+        }
+        if p.mode == ProxyMode::Manual {
+            // 非法地址拒绝落盘（面板回填重输；调用方透出 anyhow 文案）
+            p.url = Some(normalize_proxy_url(p.url.as_deref().unwrap_or(""))?);
+        }
+        self.proxy = p;
         self.persist()
     }
 
@@ -778,6 +998,7 @@ pub fn env_configured() -> bool {
         "OPENAI_BASE_URL",
         "ZNAIDE_API_KEY",
         "OPENAI_API_KEY",
+        "ZNAIDE_PROXY",
     ];
     names.iter().any(|n| {
         std::env::var(n)
@@ -822,6 +1043,7 @@ mod tests {
             persona: None,
             protocol: None,
             retry: RetryConfig::disabled(),
+            proxy: ProxyConfig::default(),
             build_tag: None,
             providers: Default::default(),
         };
@@ -869,6 +1091,7 @@ mod tests {
             persona: None,
             protocol: None,
             retry: RetryConfig::disabled(),
+            proxy: ProxyConfig::default(),
             build_tag: None,
             providers,
         };
@@ -1803,6 +2026,247 @@ mod tests {
         let back = Config::load().unwrap();
         assert_eq!(back.model.as_deref(), Some("top-override"));
         assert_eq!(back.max_turns, Some(7));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 代理 env 隔离：清掉全部代理相关 env（大小写全套 + ZNAIDE_*）。
+    fn clear_proxy_env() {
+        for v in [
+            "ZNAIDE_PROXY",
+            "ZNAIDE_NO_PROXY",
+            "HTTPS_PROXY",
+            "https_proxy",
+            "ALL_PROXY",
+            "all_proxy",
+            "HTTP_PROXY",
+            "http_proxy",
+            "NO_PROXY",
+            "no_proxy",
+        ] {
+            std::env::remove_var(v);
+        }
+    }
+
+    /// need03 U1:ProxyMode::parse 命中/回环；非法 → None
+    #[test]
+    fn proxy_mode_parse_roundtrip() {
+        assert_eq!(ProxyMode::parse("auto"), Some(ProxyMode::Auto));
+        assert_eq!(ProxyMode::parse("env"), Some(ProxyMode::Auto));
+        assert_eq!(ProxyMode::parse("follow"), Some(ProxyMode::Auto));
+        assert_eq!(ProxyMode::parse("OFF"), Some(ProxyMode::Off));
+        assert_eq!(ProxyMode::parse("direct"), Some(ProxyMode::Off));
+        assert_eq!(ProxyMode::parse("直连"), Some(ProxyMode::Off));
+        assert_eq!(ProxyMode::parse("manual"), Some(ProxyMode::Manual));
+        assert_eq!(ProxyMode::parse("手动"), Some(ProxyMode::Manual));
+        assert_eq!(ProxyMode::parse("foo"), None);
+        assert_eq!(ProxyMode::parse(""), None);
+        assert_eq!(ProxyMode::Auto.as_str(), "auto");
+        assert_eq!(ProxyMode::Off.as_str(), "off");
+        assert_eq!(ProxyMode::Manual.as_str(), "manual");
+        assert_eq!(ProxyConfig::default().mode, ProxyMode::Auto);
+    }
+
+    /// need03 U2:normalize_proxy_url 形态/归一/报错
+    #[test]
+    fn proxy_url_normalize_and_reject() {
+        // 过：四种 scheme + 认证串保留 + 尾斜杠去掉
+        assert_eq!(
+            normalize_proxy_url("http://127.0.0.1:10808").unwrap(),
+            "http://127.0.0.1:10808"
+        );
+        assert_eq!(
+            normalize_proxy_url("http://127.0.0.1:10808/").unwrap(),
+            "http://127.0.0.1:10808"
+        );
+        assert_eq!(
+            normalize_proxy_url("HTTP://127.0.0.1:10808").unwrap(),
+            "http://127.0.0.1:10808"
+        );
+        assert_eq!(
+            normalize_proxy_url("socks5h://127.0.0.1:1080").unwrap(),
+            "socks5h://127.0.0.1:1080"
+        );
+        assert_eq!(
+            normalize_proxy_url("http://u:p@host:8080").unwrap(),
+            "http://u:p@host:8080"
+        );
+        assert!(valid_proxy_url("https://proxy.example.com:3128"));
+        // 拦：ftp scheme / 无 host / 空串 / 无 scheme
+        assert!(normalize_proxy_url("ftp://x:21").is_err());
+        assert!(normalize_proxy_url("http:///").is_err());
+        assert!(normalize_proxy_url("").is_err());
+        assert!(normalize_proxy_url("127.0.0.1:10808").is_err());
+        assert!(!valid_proxy_url("ftp://x:21"));
+    }
+
+    /// need03 U3:save_proxy 落盘（Manual 存 url；切 Auto/Off 清残留；非法拒绝落盘且文件未动）
+    #[test]
+    fn quick_save_proxy_roundtrip() {
+        let _g = crate::test_util::DATA_DIR_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let dir = std::env::temp_dir().join(format!("znaide_qc_px_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::env::set_var("ZNAIDE_DATA_DIR", &dir);
+        let mut cfg = Config::default();
+        cfg.save_proxy(ProxyConfig {
+            mode: ProxyMode::Manual,
+            url: Some("http://127.0.0.1:10808/".into()),
+        })
+        .unwrap();
+        let back = Config::load().unwrap();
+        assert_eq!(back.proxy.mode, ProxyMode::Manual);
+        // 归一：尾斜杠去掉
+        assert_eq!(back.proxy.url.as_deref(), Some("http://127.0.0.1:10808"));
+        // 切 Auto 清掉残留 url
+        cfg = back;
+        cfg.save_proxy(ProxyConfig {
+            mode: ProxyMode::Auto,
+            url: Some("http://127.0.0.1:10808".into()),
+        })
+        .unwrap();
+        let back = Config::load().unwrap();
+        assert_eq!(back.proxy.mode, ProxyMode::Auto);
+        assert_eq!(back.proxy.url, None);
+        // 非法 url 拒绝落盘（Err 且文件未动）
+        assert!(cfg
+            .save_proxy(ProxyConfig {
+                mode: ProxyMode::Manual,
+                url: Some("ftp://bad".into()),
+            })
+            .is_err());
+        let back = Config::load().unwrap();
+        assert_eq!(back.proxy.mode, ProxyMode::Auto);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// need03 U4:非法 mode 回退（{"mode":"foo"} → Auto，不炸整份 config）
+    #[test]
+    fn proxy_illegal_mode_falls_back_to_auto() {
+        let cfg: Config = serde_json::from_str(
+            r#"{"provider":"ollama","proxy":{"mode":"foo","url":"http://127.0.0.1:1"}}"#,
+        )
+        .unwrap();
+        assert_eq!(cfg.proxy.mode, ProxyMode::Auto);
+        // 缺键 → Auto（老配置零迁移）
+        let cfg: Config = serde_json::from_str(r#"{"provider":"ollama"}"#).unwrap();
+        assert_eq!(cfg.proxy.mode, ProxyMode::Auto);
+        assert_eq!(cfg.proxy.url, None);
+    }
+
+    /// need03 U5:resolve_proxy 优先级
+    /// CLI --proxy/--no-proxy > ZNAIDE_NO_PROXY > 文件 Off > ZNAIDE_PROXY > 文件 Manual
+    /// > 环境(HTTPS_PROXY…) > 直连
+    #[test]
+    fn proxy_resolve_priority() {
+        let _g = crate::test_util::DATA_DIR_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        clear_proxy_env();
+        let manual = Config {
+            proxy: ProxyConfig {
+                mode: ProxyMode::Manual,
+                url: Some("http://127.0.0.1:10808".into()),
+            },
+            ..Default::default()
+        };
+        // 全空 → Direct
+        assert_eq!(
+            Config::default().resolve_proxy(None, false),
+            EffectiveProxy::Direct
+        );
+        // 文件 Manual 生效
+        assert_eq!(
+            manual.resolve_proxy(None, false),
+            EffectiveProxy::Via("http://127.0.0.1:10808".into())
+        );
+        // 环境 HTTPS_PROXY 生效（Auto 跟随）
+        std::env::set_var("HTTPS_PROXY", "http://127.0.0.1:18080");
+        assert_eq!(
+            Config::default().resolve_proxy(None, false),
+            EffectiveProxy::Via("http://127.0.0.1:18080".into())
+        );
+        // 文件 Manual 优先于 HTTPS_PROXY（只有 ZNAIDE_PROXY 能覆盖文件 manual）
+        assert_eq!(
+            manual.resolve_proxy(None, false),
+            EffectiveProxy::Via("http://127.0.0.1:10808".into())
+        );
+        // ZNAIDE_PROXY 覆盖文件 manual
+        std::env::set_var("ZNAIDE_PROXY", "http://127.0.0.1:19090");
+        assert_eq!(
+            manual.resolve_proxy(None, false),
+            EffectiveProxy::Via("http://127.0.0.1:19090".into())
+        );
+        // ZNAIDE_NO_PROXY 掐直连
+        std::env::set_var("ZNAIDE_NO_PROXY", "1");
+        assert_eq!(manual.resolve_proxy(None, false), EffectiveProxy::Direct);
+        // CLI --proxy 覆盖 ENV
+        assert_eq!(
+            manual.resolve_proxy(Some("http://127.0.0.1:17070".into()), false),
+            EffectiveProxy::Via("http://127.0.0.1:17070".into())
+        );
+        // --no-proxy 最高
+        assert_eq!(
+            manual.resolve_proxy(Some("http://127.0.0.1:17070".into()), true),
+            EffectiveProxy::Direct
+        );
+        clear_proxy_env();
+        // 文件 Off 时 env 有代理仍直连
+        std::env::set_var("HTTPS_PROXY", "http://127.0.0.1:18080");
+        let off = Config {
+            proxy: ProxyConfig {
+                mode: ProxyMode::Off,
+                url: None,
+            },
+            ..Default::default()
+        };
+        assert_eq!(off.resolve_proxy(None, false), EffectiveProxy::Direct);
+        clear_proxy_env();
+    }
+
+    /// need03 U6:EffectiveProxy::display 脱敏
+    #[test]
+    fn proxy_display_masks_password() {
+        assert_eq!(
+            EffectiveProxy::Via("http://u:p@h:8080".into()).display(),
+            "http://h:8080"
+        );
+        assert_eq!(
+            EffectiveProxy::Via("socks5h://h:1080".into()).display(),
+            "socks5h://h:1080"
+        );
+        assert_eq!(EffectiveProxy::Direct.display(), "直连");
+        assert_eq!(
+            EffectiveProxy::Via("http://h:8080".into()).url(),
+            Some("http://h:8080")
+        );
+        assert_eq!(EffectiveProxy::Direct.url(), None);
+    }
+
+    /// need03 U7:quick_save_proxy 不清空顶层 model（R2 守卫同构）
+    #[test]
+    fn quick_save_proxy_keeps_top_level() {
+        let _g = crate::test_util::DATA_DIR_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let dir = std::env::temp_dir().join(format!("znaide_qc_px2_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::env::set_var("ZNAIDE_DATA_DIR", &dir);
+        let mut cfg = Config {
+            model: Some("top-override".into()),
+            ..Default::default()
+        };
+        cfg.persist().unwrap();
+        cfg.save_proxy(ProxyConfig {
+            mode: ProxyMode::Off,
+            url: None,
+        })
+        .unwrap();
+        let back = Config::load().unwrap();
+        assert_eq!(back.model.as_deref(), Some("top-override"));
+        assert_eq!(back.proxy.mode, ProxyMode::Off);
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

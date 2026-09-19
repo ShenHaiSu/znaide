@@ -1,5 +1,5 @@
 use crate::config::Resolved;
-use crate::llm::client::{http_error, new_http_client, truncate, LlmClient};
+use crate::llm::client::{http_error, new_http_client_with_proxy, truncate, LlmClient};
 use crate::llm::openai::{AssistantReply, StreamEvent};
 use crate::llm::sse::SseParser;
 use crate::llm::types::{ChatMessage, FunctionCall, Role, ToolCall, ToolDef, Usage};
@@ -17,6 +17,8 @@ pub struct ResponsesClient {
     model: String,
     /// 稳定会话头的值(Some = 开，None = 关)。空串 = 开但真实会话 ID 未到(占位，不发头)。
     session_header: Option<String>,
+    /// 生效代理快照（与 base_url/model/api_key 并列的连接属性；变化即重建 http）
+    proxy: crate::config::EffectiveProxy,
 }
 
 // 稳定会话头(服务端 KV 缓存路由用)，与 OpenAiClient::SESSION_HEADER 同值；
@@ -463,7 +465,7 @@ fn apply_response_event(
 
 impl ResponsesClient {
     pub fn new(cfg: &Resolved) -> anyhow::Result<Self> {
-        let http = new_http_client()?;
+        let http = new_http_client_with_proxy(cfg.proxy.url())?;
         Ok(Self {
             http,
             base_url: cfg.base_url.trim_end_matches('/').to_string(),
@@ -476,6 +478,7 @@ impl ResponsesClient {
             } else {
                 None
             },
+            proxy: cfg.proxy.clone(),
         })
     }
 
@@ -483,7 +486,7 @@ impl ResponsesClient {
         &self.model
     }
 
-    /// 运行时换端点/key/模型(不动 http client,连接池留着复用)
+    /// 运行时换端点/key/模型/代理(代理是 Builder 期 baked，换出口必须重建 http，连接池不复用)
     pub fn reconfigure(&mut self, cfg: &Resolved) {
         self.base_url = cfg.base_url.trim_end_matches('/').to_string();
         self.model = cfg.model.clone();
@@ -493,6 +496,17 @@ impl ResponsesClient {
             (false, _) => self.session_header = None,
             (true, Some(v)) if !v.is_empty() => self.session_header = Some(v),
             (true, _) => self.session_header = Some(String::new()),
+        }
+        if self.proxy != cfg.proxy {
+            // 代理是 Builder 期 baked，换出口必须重建 client（连接池不复用）；
+            // 重建失败（非法 URL 漏网）保留旧 client 安全降级
+            match new_http_client_with_proxy(cfg.proxy.url()) {
+                Ok(http) => {
+                    self.http = http;
+                    self.proxy = cfg.proxy.clone();
+                }
+                Err(e) => eprintln!("⚠ 代理切换时重建客户端失败({e:#})，仍用旧代理继续"),
+            }
         }
     }
 
@@ -703,6 +717,10 @@ impl LlmClient for ResponsesClient {
 
     fn set_session_header(&mut self, enabled: bool, session_id: &str) {
         ResponsesClient::set_session_header(self, enabled, session_id)
+    }
+
+    fn effective_proxy(&self) -> crate::config::EffectiveProxy {
+        self.proxy.clone()
     }
 
     fn chat<'a>(
@@ -1083,6 +1101,7 @@ mod tests {
             protocol: crate::config::ProtocolKind::Response,
             session_header_enabled: enabled,
             retry: crate::config::RetryConfig::disabled(),
+            proxy: crate::config::EffectiveProxy::Direct,
         }
     }
 

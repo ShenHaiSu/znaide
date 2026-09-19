@@ -17,6 +17,12 @@ pub trait LlmClient: Send + Sync {
     /// 默认空实现：第三方 LlmClient 实现无需改动；双内置客户端各自 override。
     fn set_session_header(&mut self, _enabled: bool, _session_id: &str) {}
 
+    /// 当前生效代理快照（默认直连；双内置客户端各自 override 返回真实值）。
+    /// Session 建会话时用它初始化工具链路快照，与 llm 实际出口保持一致。
+    fn effective_proxy(&self) -> crate::config::EffectiveProxy {
+        crate::config::EffectiveProxy::Direct
+    }
+
     fn chat<'a>(
         &'a self,
         messages: &'a [ChatMessage],
@@ -37,16 +43,28 @@ pub trait LlmClient: Send + Sync {
     ) -> Pin<Box<dyn Future<Output = anyhow::Result<Vec<String>>> + Send + 'a>>;
 }
 
-/// 共享:HTTP 客户端构造(超时 600s + connect 10s + 环境代理),两协议客户端共用。
+/// 老函数变 wrapper：Auto 语义（跟随环境）。非法 env 吞错直连（零回归），
+/// 显式地址的 Err 只在 with_proxy 版本透出。
 pub fn new_http_client() -> anyhow::Result<reqwest::Client> {
+    let env = crate::update::env_proxy_url();
+    match new_http_client_with_proxy(env.as_deref()) {
+        Ok(c) => Ok(c),
+        Err(_) => new_http_client_with_proxy(None),
+    }
+}
+
+/// 按生效代理构造（超时 600s + connect 10s 不变）。
+/// None = 直连；Some(url) = 走该出口（含 NO_PROXY 豁免）。
+/// 显式地址非法 → Err（调用方警告 + 降级直连）；env 缺失即直连。
+pub fn new_http_client_with_proxy(proxy_url: Option<&str>) -> anyhow::Result<reqwest::Client> {
     let mut builder = reqwest::Client::builder()
         .timeout(std::time::Duration::from_secs(600))
         // 连接阶段单独限时(DNS/拒连/半开黑洞 10s 内报错),
         // 而不是干等 600s 总超时才失败
         .connect_timeout(std::time::Duration::from_secs(10));
-    // 代理走环境变量(HTTPS_PROXY/ALL_PROXY/HTTP_PROXY,NO_PROXY 豁免本地地址),
-    // 未设置即直连;本地 ollama 默认不受影响
-    if let Some(p) = crate::update::proxy_from_env() {
+    // 代理走生效地址(含 NO_PROXY 豁免);None 即直连;本地 ollama 默认不受影响
+    if let Some(u) = proxy_url.map(str::trim).filter(|u| !u.is_empty()) {
+        let p = crate::update::proxy_with_url(u)?;
         builder = builder.proxy(p);
     }
     Ok(builder.build()?)

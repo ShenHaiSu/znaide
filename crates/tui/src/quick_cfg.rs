@@ -7,14 +7,18 @@ use ratatui::layout::Rect;
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Clear, Paragraph};
-use znaide_core::config::{Config, ProtocolKind, ProviderDef, Resolved, RetryConfig};
+use znaide_core::config::{
+    Config, EffectiveProxy, ProtocolKind, ProviderDef, ProxyConfig, ProxyMode, Resolved,
+    RetryConfig,
+};
 
 use crate::config_ui::{
     context_window_text, max_turns_text, parse_context_window_input, parse_max_turns_input,
-    parse_retry_input, provider_list, retry_from_cursor, retry_text, valid_base_url,
+    parse_retry_input, provider_list, proxy_from_cursor, proxy_text, proxy_text_short,
+    retry_from_cursor, retry_text, valid_base_url, valid_proxy_url,
 };
 
-/// 按需改 9 项(02 §1 矩阵:C1–C9)。
+/// 按需改 10 项(02 §1 矩阵:C1–C9 + need03 代理 C10)。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum QcItem {
     Provider,
@@ -26,10 +30,11 @@ pub enum QcItem {
     MaxTurns,
     Retry,
     SessionHeader,
+    Proxy,
 }
 
 impl QcItem {
-    pub const ALL: [QcItem; 9] = [
+    pub const ALL: [QcItem; 10] = [
         QcItem::Provider,
         QcItem::Model,
         QcItem::Protocol,
@@ -39,6 +44,7 @@ impl QcItem {
         QcItem::MaxTurns,
         QcItem::Retry,
         QcItem::SessionHeader,
+        QcItem::Proxy,
     ];
 
     pub fn index(self) -> usize {
@@ -60,6 +66,7 @@ impl QcItem {
             QcItem::MaxTurns => "轮次上限",
             QcItem::Retry => "弱网重试",
             QcItem::SessionHeader => "会话头开关",
+            QcItem::Proxy => "网络代理",
         }
     }
 
@@ -105,6 +112,7 @@ pub fn parse_qc_alias(s: &str) -> Option<QcItem> {
         "protocol" | "协议" => Some(QcItem::Protocol),
         "provider" | "服务商" => Some(QcItem::Provider),
         "session-header" | "sessionheader" | "会话头" => Some(QcItem::SessionHeader),
+        "proxy" | "代理" | "网络代理" | "network-proxy" => Some(QcItem::Proxy),
         _ => None,
     }
 }
@@ -132,6 +140,7 @@ pub enum QuickCfgAction {
         base_url: String,
         api_key: Option<String>,
         session_header: Option<String>,
+        proxy: EffectiveProxy,
     },
 }
 
@@ -155,6 +164,9 @@ pub struct QuickCfgPanel {
     pub max_turns: Option<usize>,
     pub retry: RetryConfig,
     pub retry_cursor: usize,
+    /// 全局网络代理三档原文 + 档位游标（0=跟随环境/1=直连/2=手动指定）
+    pub proxy: ProxyConfig,
+    pub proxy_cursor: usize,
     pub typing: bool,
     pub input_buf: String,
     /// custom 家正在输入端点(与 provider 列表的 custom 选项配合)
@@ -162,6 +174,8 @@ pub struct QuickCfgPanel {
     pub typing_context_window: bool,
     pub typing_max_turns: bool,
     pub typing_retry: bool,
+    /// 代理手动档正在输入 URL（与 typing_retry 同路，共用 typing/input_buf 通道）
+    pub typing_proxy: bool,
     pub key_from_env: bool,
     pub key_env_name: Option<String>,
     pub provider_defs: std::collections::HashMap<String, ProviderDef>,
@@ -204,12 +218,15 @@ impl QuickCfgPanel {
             max_turns: None,
             retry: RetryConfig::disabled(),
             retry_cursor: 0,
+            proxy: ProxyConfig::default(),
+            proxy_cursor: 0,
             typing: false,
             input_buf: String::new(),
             typing_custom_url: false,
             typing_context_window: false,
             typing_max_turns: false,
             typing_retry: false,
+            typing_proxy: false,
             key_from_env: false,
             key_env_name: None,
             provider_defs: std::collections::HashMap::new(),
@@ -285,6 +302,18 @@ impl QuickCfgPanel {
                 _ => 4,
             }
         };
+        // 代理全局（切家不重置，apply_provider_defaults 不碰它）
+        let mut proxy = cfg.proxy.clone();
+        // 归一：mode 非 manual → url=None 显示干净
+        if proxy.mode != ProxyMode::Manual {
+            proxy.url = None;
+        }
+        self.proxy = proxy;
+        self.proxy_cursor = match self.proxy.mode {
+            ProxyMode::Auto => 0,
+            ProxyMode::Off => 1,
+            ProxyMode::Manual => 2,
+        };
     }
 
     pub fn prefill(&mut self) {
@@ -306,6 +335,7 @@ impl QuickCfgPanel {
         self.typing_context_window = false;
         self.typing_max_turns = false;
         self.typing_retry = false;
+        self.typing_proxy = false;
         self.notice.clear();
         match item {
             QcItem::Model => {
@@ -332,6 +362,14 @@ impl QuickCfgPanel {
                         8 => 3,
                         _ => 4,
                     }
+                };
+            }
+            QcItem::Proxy => {
+                // 游标按当前值落位（照抄 Retry 分支）
+                self.proxy_cursor = match self.proxy.mode {
+                    ProxyMode::Auto => 0,
+                    ProxyMode::Off => 1,
+                    ProxyMode::Manual => 2,
                 };
             }
             _ => {}
@@ -399,6 +437,32 @@ impl QuickCfgPanel {
             protocol: self.protocol,
             session_header_enabled: self.session_header,
             retry: self.retry,
+            proxy: self.effective_proxy_for_draft(),
+        }
+    }
+
+    /// 面板当前三档按 03 §3 落定（env 部分照读，CLI 无；与 resolve_proxy 同优先级，别手写第二份）。
+    pub fn effective_proxy_for_draft(&self) -> EffectiveProxy {
+        match self.proxy.mode {
+            ProxyMode::Off => EffectiveProxy::Direct,
+            ProxyMode::Manual => match self
+                .proxy
+                .url
+                .as_deref()
+                .map(str::trim)
+                .filter(|u| !u.is_empty())
+            {
+                Some(u) => EffectiveProxy::Via(u.to_string()),
+                // 面板 confirm 已拦空串；此处兜底按跟随环境
+                None => match znaide_core::update::env_proxy_url() {
+                    Some(e) => EffectiveProxy::Via(e),
+                    None => EffectiveProxy::Direct,
+                },
+            },
+            ProxyMode::Auto => match znaide_core::update::env_proxy_url() {
+                Some(e) => EffectiveProxy::Via(e),
+                None => EffectiveProxy::Direct,
+            },
         }
     }
 
@@ -445,6 +509,7 @@ impl QuickCfgPanel {
             QcItem::ContextWindow => context_window_text(self.context_window),
             QcItem::MaxTurns => max_turns_text(self.max_turns),
             QcItem::Retry => retry_text(&self.retry),
+            QcItem::Proxy => proxy_text(&self.proxy),
             QcItem::SessionHeader => {
                 if self.session_header {
                     "开".to_string()
@@ -539,6 +604,8 @@ impl QuickCfgPanel {
             } else {
                 None
             },
+            // 验证阶段的模型列表查询同样走待存代理
+            proxy: self.effective_proxy_for_draft(),
         }
     }
 
@@ -617,6 +684,41 @@ impl QuickCfgPanel {
             }
             return QuickCfgAction::None;
         }
+        if self.typing_proxy {
+            self.typing_proxy = false;
+            // 空输入 → 回 Auto（“清空即回自动”）
+            if v.trim().is_empty() {
+                self.proxy = proxy_from_cursor(0, None);
+                self.proxy_cursor = 0;
+                self.notice = "代理已切回跟随环境,按 s 直接提交,或 v 验证后提交。".into();
+                return QuickCfgAction::None;
+            }
+            if !valid_proxy_url(v) {
+                // 回填重输（照抄窗口/轮数口径）
+                self.input_buf = v.trim().to_string();
+                self.typing = true;
+                self.typing_proxy = true;
+                self.notice = "代理地址要形如 http(s)://host:port 或 socks5(h)://host:port,请重新输入(清空回车 = 跟随环境):".into();
+                return QuickCfgAction::None;
+            }
+            match znaide_core::config::normalize_proxy_url(v) {
+                Ok(n) => {
+                    self.proxy = ProxyConfig {
+                        mode: ProxyMode::Manual,
+                        url: Some(n),
+                    };
+                    self.proxy_cursor = 2;
+                    self.notice = "代理已更新,`s` 直存 / `v` 验证后提交。".into();
+                }
+                Err(e) => {
+                    self.input_buf = v.trim().to_string();
+                    self.typing = true;
+                    self.typing_proxy = true;
+                    self.notice = format!("{e:#},请重新输入(清空回车 = 跟随环境):");
+                }
+            }
+            return QuickCfgAction::None;
+        }
         match item {
             QcItem::Model => {
                 if v.trim().is_empty() {
@@ -668,6 +770,7 @@ impl QuickCfgPanel {
                     self.typing_context_window = false;
                     self.typing_max_turns = false;
                     self.typing_retry = false;
+                    self.typing_proxy = false;
                     self.input_buf.clear();
                 }
                 KeyCode::Backspace => {
@@ -707,6 +810,16 @@ impl QuickCfgPanel {
                         if item == QcItem::Model && self.models.is_empty() {
                             return self.fetch_models_action();
                         }
+                    }
+                    QuickCfgAction::None
+                }
+                // 第 10 项数字键直达（'1'-'9' 不够用，'0' = index 9）
+                KeyCode::Char('0') => {
+                    let i = 9;
+                    if i < QcItem::ALL.len() {
+                        let item = QcItem::from_index(i);
+                        self.menu_cursor = i;
+                        self.enter_edit(item);
                     }
                     QuickCfgAction::None
                 }
@@ -959,8 +1072,59 @@ impl QuickCfgPanel {
                             QuickCfgAction::None
                         }
                         KeyCode::Enter | KeyCode::Char('e') => {
+                            self.notice = "会话头已选择,按 s 直接提交,或 v 验证后提交。".into();
+                            QuickCfgAction::None
+                        }
+                        _ => QuickCfgAction::None,
+                    },
+                    QcItem::Proxy => match key.code {
+                        KeyCode::Up | KeyCode::Char('k') => {
+                            self.proxy_cursor = self.proxy_cursor.saturating_sub(1);
+                            self.proxy =
+                                proxy_from_cursor(self.proxy_cursor, self.proxy.url.clone());
+                            QuickCfgAction::None
+                        }
+                        KeyCode::Down | KeyCode::Char('j') => {
+                            self.proxy_cursor = (self.proxy_cursor + 1).min(2);
+                            self.proxy =
+                                proxy_from_cursor(self.proxy_cursor, self.proxy.url.clone());
+                            QuickCfgAction::None
+                        }
+                        // y = 跟随环境（follow），n = 直连（no proxy）
+                        KeyCode::Char('y') | KeyCode::Char('Y') => {
+                            self.proxy_cursor = 0;
+                            self.proxy = proxy_from_cursor(0, None);
+                            self.notice = "代理:跟随环境。按 s 直接提交,或 v 验证后提交。".into();
+                            QuickCfgAction::None
+                        }
+                        KeyCode::Char('n') | KeyCode::Char('N') => {
+                            self.proxy_cursor = 1;
+                            self.proxy = proxy_from_cursor(1, None);
                             self.notice =
-                                "会话头已选择,按 s 直接提交,或 v 验证后提交。".into();
+                                "代理:直连(忽略环境代理)。按 s 直接提交,或 v 验证后提交。".into();
+                            QuickCfgAction::None
+                        }
+                        KeyCode::Char(c) if c.is_ascii_digit() => {
+                            self.typing = true;
+                            self.typing_proxy = true;
+                            self.input_buf.clear();
+                            self.input_buf.push(c);
+                            self.notice =
+                                "输入代理地址(形如 http://127.0.0.1:10808，清空回车 = 跟随环境):"
+                                    .into();
+                            QuickCfgAction::None
+                        }
+                        KeyCode::Char('t')
+                        | KeyCode::Char('T')
+                        | KeyCode::Char('e')
+                        | KeyCode::Char('E')
+                        | KeyCode::Enter => {
+                            self.typing = true;
+                            self.typing_proxy = true;
+                            self.input_buf = self.proxy.url.clone().unwrap_or_default();
+                            self.notice =
+                                "输入代理地址(形如 http://127.0.0.1:10808，清空回车 = 跟随环境):"
+                                    .into();
                             QuickCfgAction::None
                         }
                         _ => QuickCfgAction::None,
@@ -993,7 +1157,7 @@ impl QuickCfgPanel {
         // 顶部摘要行(与全向导同样式)
         lines.push(Line::from(vec![Span::styled(
             format!(
-                "当前: {} / {} / {} · 轮数{} · 重试{} · 窗口{}",
+                "当前: {} / {} / {} · 轮数{} · 重试{} · 窗口{} · 代理{}",
                 if self.provider.is_empty() {
                     "?"
                 } else {
@@ -1012,6 +1176,7 @@ impl QuickCfgPanel {
                 max_turns_text(self.max_turns),
                 retry_text(&self.retry),
                 context_window_text(self.context_window),
+                proxy_text_short(&self.proxy),
             ),
             Style::default().fg(Color::DarkGray),
         )]));
@@ -1032,7 +1197,12 @@ impl QuickCfgPanel {
                     lines.push(Line::from(vec![Span::styled(
                         format!(
                             "{cur} {}. {}: {} {}",
-                            i + 1,
+                            // 第 10 项数字键是 '0'（'1'-'9' 不够用），显示与按键一致
+                            if i == 9 {
+                                "0".to_string()
+                            } else {
+                                (i + 1).to_string()
+                            },
                             item.title(),
                             self.current_value(*item),
                             item.tag()
@@ -1042,7 +1212,7 @@ impl QuickCfgPanel {
                 }
                 lines.push(Line::from(""));
                 lines.push(Line::from(vec![Span::styled(
-                    "↑↓ 选择 · Enter 编辑 · 1-9 直达 · Esc 退出",
+                    "↑↓ 选择 · Enter 编辑 · 1-9,0 直达 · Esc 退出",
                     Style::default().fg(Color::DarkGray),
                 )]));
             }
@@ -1192,6 +1362,30 @@ impl QuickCfgPanel {
                             Style::default().fg(Color::DarkGray),
                         )]));
                     }
+                    QcItem::Proxy => {
+                        lines.push(Line::from(
+                            "全局出口：模型请求 / 网页抓取 / 更新检查统一走这里。本地 ollama 等走 NO_PROXY 豁免，不受影响。",
+                        ));
+                        for (i, name) in ["跟随环境(默认)", "直连(忽略环境代理)", "手动指定…"]
+                            .iter()
+                            .enumerate()
+                        {
+                            let cur = if i == self.proxy_cursor { ">" } else { " " };
+                            let style = if i == self.proxy_cursor {
+                                Style::default().fg(Color::Black).bg(Color::Cyan)
+                            } else {
+                                Style::default()
+                            };
+                            lines.push(Line::from(vec![Span::styled(
+                                format!("{cur} {name}"),
+                                style,
+                            )]));
+                        }
+                        lines.push(Line::from(vec![Span::styled(
+                            "↑↓ 档位 · y 跟随环境 / n 直连 · 数字/t/e/Enter 手输地址",
+                            Style::default().fg(Color::DarkGray),
+                        )]));
+                    }
                 }
                 if self.typing {
                     lines.push(Line::from(vec![
@@ -1294,10 +1488,23 @@ mod tests {
         assert_eq!(parse_qc_alias("协议"), Some(QcItem::Protocol));
         assert_eq!(parse_qc_alias("provider"), Some(QcItem::Provider));
         assert_eq!(parse_qc_alias("服务商"), Some(QcItem::Provider));
-        assert_eq!(parse_qc_alias("session_header"), Some(QcItem::SessionHeader));
+        assert_eq!(
+            parse_qc_alias("session_header"),
+            Some(QcItem::SessionHeader)
+        );
         assert_eq!(parse_qc_alias("会话头"), Some(QcItem::SessionHeader));
         assert_eq!(parse_qc_alias("乱七八糟"), None);
         assert_eq!(parse_qc_alias(""), None);
+    }
+
+    /// need03 U8:代理别名命中
+    #[test]
+    fn proxy_alias_hits() {
+        assert_eq!(parse_qc_alias("proxy"), Some(QcItem::Proxy));
+        assert_eq!(parse_qc_alias("代理"), Some(QcItem::Proxy));
+        assert_eq!(parse_qc_alias("网络代理"), Some(QcItem::Proxy));
+        assert_eq!(parse_qc_alias("network_proxy"), Some(QcItem::Proxy));
+        assert_eq!(parse_qc_alias("PROXY"), Some(QcItem::Proxy));
     }
 
     /// need03 U8:数字三路(留空/0/非法/超限)与 confirm_typed 同语义
@@ -1362,7 +1569,7 @@ mod tests {
         assert_eq!(p.api_key, "sk");
     }
 
-    /// need03 U10:默认收口矩阵(C1–C5 验证,C6–C9 直接)
+    /// need03 U10:默认收口矩阵(C1–C5+代理 验证,C6–C9 直接)
     #[test]
     fn default_submit_matrix() {
         for i in [
@@ -1371,6 +1578,8 @@ mod tests {
             QcItem::Protocol,
             QcItem::ApiKey,
             QcItem::BaseUrl,
+            // 代理填错 = 全网不通，必须验证（与 BaseUrl 同档）
+            QcItem::Proxy,
         ] {
             assert_eq!(i.default_submit(), SubmitKind::Verified, "{:?}", i);
         }
@@ -1497,5 +1706,62 @@ mod tests {
         assert_eq!(p.provider, "houseB");
         assert_eq!(p.model, "model-b");
         assert!(p.api_key.is_empty());
+    }
+
+    /// need03 U9:代理档位键（↑↓切三档即时落值；y→Auto/n→Off；Enter进手输；
+    /// 非法URL回填重输；空输入回Auto；数字键0直达第10项）
+    #[test]
+    fn proxy_cursor_keys_and_manual() {
+        let mut p = panel_with_cfg();
+        // 数字键 0 直达第 10 项
+        match p.on_key(key(KeyCode::Char('0'))) {
+            QuickCfgAction::None => {}
+            _ => panic!("0 应直达第 10 项"),
+        }
+        assert_eq!(p.step, QcStep::Edit(QcItem::Proxy));
+        // ↓ 切到直连即时落值
+        p.on_key(key(KeyCode::Down));
+        assert_eq!(p.proxy_cursor, 1);
+        assert_eq!(p.proxy.mode, ProxyMode::Off);
+        // ↓ 切到手动（保持原 url）
+        p.on_key(key(KeyCode::Down));
+        assert_eq!(p.proxy_cursor, 2);
+        assert_eq!(p.proxy.mode, ProxyMode::Manual);
+        // y 回跟随环境
+        p.on_key(key(KeyCode::Char('y')));
+        assert_eq!(p.proxy.mode, ProxyMode::Auto);
+        assert_eq!(p.proxy_cursor, 0);
+        // n 到直连
+        p.on_key(key(KeyCode::Char('n')));
+        assert_eq!(p.proxy.mode, ProxyMode::Off);
+        // Enter 进手输
+        p.on_key(key(KeyCode::Enter));
+        assert!(p.typing && p.typing_proxy);
+        // 非法 URL 回填重输（仍在输入态）
+        for c in "ftp://bad".chars() {
+            p.on_key(key(KeyCode::Char(c)));
+        }
+        p.on_key(key(KeyCode::Enter));
+        assert!(p.typing && p.typing_proxy, "非法地址应回填重输");
+        assert_eq!(p.input_buf, "ftp://bad");
+        // Esc 退出输入态
+        p.on_key(key(KeyCode::Esc));
+        assert!(!p.typing);
+        // 合法地址进 Manual
+        p.on_key(key(KeyCode::Enter));
+        for c in "http://127.0.0.1:10808/".chars() {
+            p.on_key(key(KeyCode::Char(c)));
+        }
+        // input_buf 预填了现存 url（空），上面逐字追加后确认
+        p.on_key(key(KeyCode::Enter));
+        assert_eq!(p.proxy.mode, ProxyMode::Manual);
+        assert_eq!(p.proxy.url.as_deref(), Some("http://127.0.0.1:10808"));
+        assert_eq!(p.proxy_cursor, 2);
+        // 空输入回 Auto（进手输后清空预填再确认）
+        p.on_key(key(KeyCode::Enter));
+        assert!(p.typing && p.typing_proxy);
+        p.input_buf.clear();
+        p.on_key(key(KeyCode::Enter));
+        assert_eq!(p.proxy.mode, ProxyMode::Auto);
     }
 }

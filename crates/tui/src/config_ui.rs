@@ -9,6 +9,8 @@ use ratatui::widgets::{Block, Borders, Clear, Paragraph};
 use znaide_core::config::Config;
 use znaide_core::config::ProtocolKind;
 use znaide_core::config::ProviderDef;
+use znaide_core::config::ProxyConfig;
+use znaide_core::config::ProxyMode;
 use znaide_core::config::Resolved;
 use znaide_core::config::RetryConfig;
 
@@ -33,6 +35,8 @@ pub enum Step {
     MaxTurns,
     /// 弱网重试(单次模型调用遇空回复/可重试错误后的追加次数;关闭/3/5/8/手动)
     Retry,
+    /// 全局网络代理(跟随环境/直连/手动指定；模型请求/抓取/更新统一出口)
+    Proxy,
     /// 正在验证(等待宿主回调)
     Verifying,
 }
@@ -50,6 +54,7 @@ pub enum WizardAction {
         base_url: String,
         api_key: Option<String>,
         session_header: Option<String>,
+        proxy: znaide_core::config::EffectiveProxy,
     },
     /// 验证连接(base_url/model/api_key,由宿主调用 client.validate)
     Verify(Resolved),
@@ -106,6 +111,13 @@ pub struct SetupWizard {
     pub retry_cursor: usize,
     /// 当前 typing 输入的是 retry 手动次数
     pub typing_retry: bool,
+    /// 全局网络代理三档原文（默认 Auto）。由 `prefill()` 带出、保存时写进顶层 proxy；
+    /// draft 落定进 Resolved，随重配即时生效。切家不重置（全局，与家无关）。
+    pub proxy: ProxyConfig,
+    /// 代理档位游标(0=跟随环境, 1=直连, 2=手动指定)
+    pub proxy_cursor: usize,
+    /// 当前 typing 输入的是 proxy 手动地址
+    pub typing_proxy: bool,
     /// Key 来自环境变量(api_key_env):面板里显示为空但实际可用
     pub key_from_env: bool,
     /// 打开面板时快照的合并后 provider 表:切服务商时按名字取"它自己"的
@@ -141,6 +153,9 @@ impl SetupWizard {
             retry: RetryConfig::disabled(),
             retry_cursor: 0,
             typing_retry: false,
+            proxy: ProxyConfig::default(),
+            proxy_cursor: 0,
+            typing_proxy: false,
             key_from_env: false,
             provider_defs: std::collections::HashMap::new(),
         }
@@ -191,6 +206,8 @@ impl SetupWizard {
         // 会话头开关同样跟服务商走:换家即换开关,不沿用上一家
         self.session_header = def.as_ref().map(|d| d.session_header).unwrap_or(false);
         self.session_cursor = if self.session_header { 0 } else { 1 };
+        // 代理是全局网络环境配置，不跟家走：切家不重置（与 retry 的顶层口径一致，
+        // 但 retry 同样不跟家走——这里刻意不碰 self.proxy，防后人“顺手”加上）
     }
 
     /// 用现有配置预填(重开 `/config` 时把已经配好的值显示出来)。
@@ -272,6 +289,17 @@ impl SetupWizard {
                 _ => 4,
             }
         };
+        // 代理全局（顶层 proxy，缺键 = Auto）。归一：非 manual 清掉残留 url。
+        let mut proxy = cfg.proxy.clone();
+        if proxy.mode != ProxyMode::Manual {
+            proxy.url = None;
+        }
+        self.proxy = proxy;
+        self.proxy_cursor = match self.proxy.mode {
+            ProxyMode::Auto => 0,
+            ProxyMode::Off => 1,
+            ProxyMode::Manual => 2,
+        };
     }
 
     /// 是否已有配置可展示(首次运行全空 → 不显示摘要行)
@@ -323,7 +351,50 @@ impl SetupWizard {
             protocol: self.protocol,
             session_header_enabled: self.session_header,
             retry: self.retry,
+            proxy: self.effective_proxy_for_draft(),
         }
+    }
+
+    /// 面板当前三档按 03 §3 落定（env 部分照读，CLI 无；与 resolve_proxy 同优先级，别手写第二份）。
+    pub fn effective_proxy_for_draft(&self) -> znaide_core::config::EffectiveProxy {
+        match self.proxy.mode {
+            ProxyMode::Off => znaide_core::config::EffectiveProxy::Direct,
+            ProxyMode::Manual => {
+                match self
+                    .proxy
+                    .url
+                    .as_deref()
+                    .map(str::trim)
+                    .filter(|u| !u.is_empty())
+                {
+                    Some(u) => znaide_core::config::EffectiveProxy::Via(u.to_string()),
+                    // 面板 confirm 已拦空串；此处兜底按跟随环境
+                    None => match znaide_core::update::env_proxy_url() {
+                        Some(e) => znaide_core::config::EffectiveProxy::Via(e),
+                        None => znaide_core::config::EffectiveProxy::Direct,
+                    },
+                }
+            }
+            ProxyMode::Auto => match znaide_core::update::env_proxy_url() {
+                Some(e) => znaide_core::config::EffectiveProxy::Via(e),
+                None => znaide_core::config::EffectiveProxy::Direct,
+            },
+        }
+    }
+
+    /// 进入代理选择:光标落在当前档位上(跟随环境/直连/手动指定)
+    fn enter_proxy(&mut self) {
+        self.proxy_cursor = match self.proxy.mode {
+            ProxyMode::Auto => 0,
+            ProxyMode::Off => 1,
+            ProxyMode::Manual => 2,
+        };
+        self.step = Step::Proxy;
+    }
+
+    /// 档位游标变化即时落到 proxy(手动档保持原 url，进输入后才改)
+    fn apply_proxy_cursor(&mut self) {
+        self.proxy = proxy_from_cursor(self.proxy_cursor, self.proxy.url.clone());
     }
 
     /// 进入会话头选择:光标落在当前值上(重开面板预填时落在已存值上)
@@ -428,6 +499,8 @@ impl SetupWizard {
             } else {
                 None
             },
+            // 验证阶段的模型列表查询同样走待存代理
+            proxy: self.effective_proxy_for_draft(),
         }
     }
 
@@ -457,6 +530,7 @@ impl SetupWizard {
                     self.typing_max_turns = false;
                     self.typing_context_window = false;
                     self.typing_retry = false;
+                    self.typing_proxy = false;
                     self.input_buf.clear();
                 }
                 KeyCode::Backspace => {
@@ -766,21 +840,18 @@ impl SetupWizard {
                         } else {
                             String::new()
                         };
-                        self.notice =
-                            "输入弱网重试次数(空/0 = 关闭，1..=8，超限按 8 算):".into();
+                        self.notice = "输入弱网重试次数(空/0 = 关闭，1..=8，超限按 8 算):".into();
                         WizardAction::None
                     } else {
-                        // 完成:验证
-                        self.step = Step::Verifying;
-                        self.progress = format!("正在验证 {} / {} …", self.provider, self.model);
-                        WizardAction::Verify(self.draft())
+                        // 下一步:网络代理
+                        self.enter_proxy();
+                        WizardAction::None
                     }
                 }
                 KeyCode::Char('s') | KeyCode::Char('S') => {
-                    // 完成:验证(用当前重试档位)
-                    self.step = Step::Verifying;
-                    self.progress = format!("正在验证 {} / {} …", self.provider, self.model);
-                    WizardAction::Verify(self.draft())
+                    // 下一步:网络代理(用当前重试档位)
+                    self.enter_proxy();
+                    WizardAction::None
                 }
                 KeyCode::Esc => {
                     self.step = Step::MaxTurns;
@@ -788,10 +859,68 @@ impl SetupWizard {
                 }
                 _ => WizardAction::None,
             },
-            Step::Verifying => {
-                // 等待宿主;按 Esc 回到上一步(弱网重试)
-                if matches!(key.code, KeyCode::Esc) {
+            Step::Proxy => match key.code {
+                KeyCode::Up | KeyCode::Char('k') => {
+                    self.proxy_cursor = self.proxy_cursor.saturating_sub(1);
+                    self.apply_proxy_cursor();
+                    WizardAction::None
+                }
+                KeyCode::Down | KeyCode::Char('j') => {
+                    self.proxy_cursor = (self.proxy_cursor + 1).min(2);
+                    self.apply_proxy_cursor();
+                    WizardAction::None
+                }
+                // y = 跟随环境，n = 直连
+                KeyCode::Char('y') | KeyCode::Char('Y') => {
+                    self.proxy_cursor = 0;
+                    self.apply_proxy_cursor();
+                    self.notice = "代理:跟随环境。按 s 验证并完成".into();
+                    WizardAction::None
+                }
+                KeyCode::Char('n') | KeyCode::Char('N') => {
+                    self.proxy_cursor = 1;
+                    self.apply_proxy_cursor();
+                    self.notice = "代理:直连(忽略环境代理)。按 s 验证并完成".into();
+                    WizardAction::None
+                }
+                // 直接敲数字进手动地址输入（照抄 Retry 数字口径；字母用 t/e/Enter 进输入再敲全串）
+                KeyCode::Char(c) if c.is_ascii_digit() => {
+                    self.typing = true;
+                    self.typing_proxy = true;
+                    self.input_buf.clear();
+                    self.input_buf.push(c);
+                    self.notice =
+                        "输入代理地址(形如 http://127.0.0.1:10808，清空回车 = 跟随环境):".into();
+                    WizardAction::None
+                }
+                KeyCode::Char('t')
+                | KeyCode::Char('T')
+                | KeyCode::Char('e')
+                | KeyCode::Char('E')
+                | KeyCode::Enter => {
+                    self.typing = true;
+                    self.typing_proxy = true;
+                    self.input_buf = self.proxy.url.clone().unwrap_or_default();
+                    self.notice =
+                        "输入代理地址(形如 http://127.0.0.1:10808，清空回车 = 跟随环境):".into();
+                    WizardAction::None
+                }
+                KeyCode::Char('s') | KeyCode::Char('S') => {
+                    // 完成:验证(用当前代理档位)
+                    self.step = Step::Verifying;
+                    self.progress = format!("正在验证 {} / {} …", self.provider, self.model);
+                    WizardAction::Verify(self.draft())
+                }
+                KeyCode::Esc => {
                     self.step = Step::Retry;
+                    WizardAction::None
+                }
+                _ => WizardAction::None,
+            },
+            Step::Verifying => {
+                // 等待宿主;按 Esc 回到上一步(网络代理)
+                if matches!(key.code, KeyCode::Esc) {
+                    self.step = Step::Proxy;
                 }
                 WizardAction::None
             }
@@ -896,6 +1025,43 @@ impl SetupWizard {
                 }
             };
         }
+        // 代理手动地址:空 = 跟随环境；合法归一进 Manual；非法回填重输
+        if self.typing_proxy {
+            self.typing_proxy = false;
+            let t = v.trim();
+            if t.is_empty() {
+                self.proxy = proxy_from_cursor(0, None);
+                self.proxy_cursor = 0;
+                self.notice = "代理:跟随环境。按 s 验证并完成".into();
+                return WizardAction::None;
+            }
+            if !valid_proxy_url(t) {
+                self.input_buf = t.to_string();
+                self.typing = true;
+                self.typing_proxy = true;
+                self.notice =
+                    "代理地址要形如 http(s)://host:port 或 socks5(h)://host:port,请重新输入(清空回车 = 跟随环境):".into();
+                return WizardAction::None;
+            }
+            return match znaide_core::config::normalize_proxy_url(t) {
+                Ok(n) => {
+                    self.proxy = ProxyConfig {
+                        mode: ProxyMode::Manual,
+                        url: Some(n),
+                    };
+                    self.proxy_cursor = 2;
+                    self.notice = "代理已更新。按 s 验证并完成".into();
+                    WizardAction::None
+                }
+                Err(e) => {
+                    self.input_buf = t.to_string();
+                    self.typing = true;
+                    self.typing_proxy = true;
+                    self.notice = format!("{e:#},请重新输入(清空回车 = 跟随环境):");
+                    WizardAction::None
+                }
+            };
+        }
         match self.step {
             // 自定义服务商:提交的是端点,先问会话头,确认后才查询模型
             Step::Provider if self.provider == "custom" => {
@@ -955,7 +1121,8 @@ impl SetupWizard {
             "6 上下文窗口",
             "7 轮数上限",
             "8 弱网重试",
-            "9 验证",
+            "9 代理",
+            "10 验证",
         ];
         let current = match self.step {
             Step::Provider => 0,
@@ -966,7 +1133,8 @@ impl SetupWizard {
             Step::ContextWindow => 5,
             Step::MaxTurns => 6,
             Step::Retry => 7,
-            Step::Verifying => 8,
+            Step::Proxy => 8,
+            Step::Verifying => 9,
         };
         let mut bar: Vec<Span> = Vec::new();
         for (i, s) in steps.iter().enumerate() {
@@ -1006,13 +1174,14 @@ impl SetupWizard {
                 ),
                 Span::styled(
                     format!(
-                        "  端点 {}  Key {}  窗口 {}  轮数 {}  重试 {}  会话头 {}",
+                        "  端点 {}  Key {}  窗口 {}  轮数 {}  重试 {}  会话头 {}  代理 {}",
                         self.base_url,
                         key,
                         self.context_window_label(),
                         self.max_turns_label(),
                         self.retry_label(),
                         if self.session_header { "开" } else { "关" },
+                        proxy_text_short(&self.proxy),
                     ),
                     Style::default().fg(Color::DarkGray),
                 ),
@@ -1309,7 +1478,48 @@ impl SetupWizard {
                     ]));
                 }
                 lines.push(Line::from(Span::styled(
-                    "↑↓ 选择档位(手动档回车后输入 0..=8)| Enter 或 s 验证并完成 | Esc 返回改轮数",
+                    "↑↓ 选择档位(手动档回车后输入 0..=8)| Enter 或 s 下一步(网络代理) | Esc 返回改轮数",
+                    Style::default().fg(Color::Cyan),
+                )));
+            }
+            Step::Proxy => {
+                lines.push(Line::from(Span::styled(
+                    format!("服务商: {} | 模型: {}", self.provider, self.model),
+                    Style::default().fg(Color::Green),
+                )));
+                lines.push(Line::from(vec![
+                    Span::styled("网络代理: ", Style::default().fg(Color::DarkGray)),
+                    Span::styled(
+                        proxy_text(&self.proxy),
+                        Style::default()
+                            .fg(Color::White)
+                            .add_modifier(Modifier::BOLD),
+                    ),
+                ]));
+                lines.push(Line::from(Span::styled(
+                    "全局出口：模型请求 / 网页抓取 / 更新检查统一走这里。本地 ollama 等走 NO_PROXY 豁免，不受影响。",
+                    Style::default().fg(Color::DarkGray),
+                )));
+                for (i, label) in ["跟随环境(默认)", "直连(忽略环境代理)", "手动指定…"]
+                    .iter()
+                    .enumerate()
+                {
+                    let sel = i == self.proxy_cursor.min(2);
+                    let marker = if sel { "▶ " } else { "  " };
+                    let st = if sel {
+                        Style::default()
+                            .fg(Color::White)
+                            .add_modifier(Modifier::BOLD)
+                    } else {
+                        Style::default().fg(Color::DarkGray)
+                    };
+                    lines.push(Line::from(vec![
+                        Span::styled(marker, Style::default().fg(Color::Cyan)),
+                        Span::styled(label.to_string(), st),
+                    ]));
+                }
+                lines.push(Line::from(Span::styled(
+                    "↑↓ 选择档位 · y 跟随环境 / n 直连 · 数字/t/e/Enter 手输地址 | s 验证并完成 | Esc 返回改重试",
                     Style::default().fg(Color::Cyan),
                 )));
             }
@@ -1457,6 +1667,73 @@ pub(crate) fn valid_base_url(v: &str) -> bool {
     !v.is_empty() && (v.starts_with("http://") || v.starts_with("https://"))
 }
 
+/// 代理地址校验（薄包 core，与 valid_base_url 同位置，供 quick_cfg 复用）。
+pub(crate) fn valid_proxy_url(v: &str) -> bool {
+    znaide_core::config::valid_proxy_url(v)
+}
+
+/// 代理档位游标→ProxyConfig（0=跟随环境/1=直连/2=手动保持原 url；与 retry_from_cursor 同画风）。
+pub(crate) fn proxy_from_cursor(cursor: usize, url: Option<String>) -> ProxyConfig {
+    match cursor {
+        1 => ProxyConfig {
+            mode: ProxyMode::Off,
+            url: None,
+        },
+        2 => ProxyConfig {
+            mode: ProxyMode::Manual,
+            url,
+        },
+        _ => ProxyConfig {
+            mode: ProxyMode::Auto,
+            url: None,
+        },
+    }
+}
+
+/// 代理三档文案（quick_cfg::current_value 与全向导摘要共用，别各写一遍）。
+pub(crate) fn proxy_text(p: &ProxyConfig) -> String {
+    match p.mode {
+        ProxyMode::Off => "直连(忽略环境代理)".to_string(),
+        ProxyMode::Manual => {
+            let disp = p
+                .url
+                .as_deref()
+                .map(znaide_core::config::mask_proxy_url)
+                .unwrap_or_else(|| "(未填地址)".to_string());
+            format!("手动 {disp}")
+        }
+        ProxyMode::Auto => match znaide_core::update::env_proxy_url() {
+            Some(u) => format!("跟随环境(当前 {})", znaide_core::config::mask_proxy_url(&u)),
+            None => "跟随环境(当前直连)".to_string(),
+        },
+    }
+}
+
+/// 代理短版（顶部摘要行用，超长截断 24）。
+pub(crate) fn proxy_text_short(p: &ProxyConfig) -> String {
+    let s = match p.mode {
+        ProxyMode::Off => "直连".to_string(),
+        ProxyMode::Manual => {
+            let disp = p
+                .url
+                .as_deref()
+                .map(znaide_core::config::mask_proxy_url)
+                .unwrap_or_else(|| "?".to_string());
+            format!("手动:{disp}")
+        }
+        ProxyMode::Auto => match znaide_core::update::env_proxy_url() {
+            Some(u) => format!("环境:{}", znaide_core::config::mask_proxy_url(&u)),
+            None => "环境(直连)".to_string(),
+        },
+    };
+    if s.chars().count() > 24 {
+        let t: String = s.chars().take(24).collect();
+        format!("{t}…")
+    } else {
+        s
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1549,18 +1826,27 @@ mod tests {
         assert!(matches!(w.on_key(key(KeyCode::Enter)), WizardAction::None));
         assert_eq!(w.step, Step::Retry);
 
-        // 重试档位默认关闭；选 5 次后按 s → 验证
+        // 重试档位默认关闭；选 5 次后按 s → 网络代理（need03 P4：Retry 之后是 Proxy）
         assert_eq!(w.retry_label(), "关闭");
         w.on_key(key(KeyCode::Down));
         w.on_key(key(KeyCode::Down));
         assert!(w.retry.enabled && w.retry.max_retries == 5);
+        assert!(matches!(
+            w.on_key(key(KeyCode::Char('s'))),
+            WizardAction::None
+        ));
+        assert_eq!(w.step, Step::Proxy);
+        // 代理默认跟随环境；按 s → 验证
+        assert_eq!(w.proxy.mode, ProxyMode::Auto);
         match w.on_key(key(KeyCode::Char('s'))) {
             WizardAction::Verify(r) => assert_eq!(r.model, "qwen3:8b"),
             _ => panic!("s 应触发验证"),
         }
         assert_eq!(w.step, Step::Verifying);
 
-        // Esc 从验证回退到重试，再 Esc 回轮数上限
+        // Esc 从验证回退到代理，再 Esc 回重试，再 Esc 回轮数上限
+        w.on_key(key(KeyCode::Esc));
+        assert_eq!(w.step, Step::Proxy);
         w.on_key(key(KeyCode::Esc));
         assert_eq!(w.step, Step::Retry);
         w.on_key(key(KeyCode::Esc));
@@ -1583,6 +1869,7 @@ mod tests {
             build_tag: None,
             protocol: None,
             retry: RetryConfig::disabled(),
+            proxy: ProxyConfig::default(),
             providers: Default::default(),
         };
         w.apply_config(&cfg);
@@ -1631,6 +1918,7 @@ mod tests {
             build_tag: None,
             protocol: None,
             retry: RetryConfig::disabled(),
+            proxy: ProxyConfig::default(),
             providers,
         };
         let mut w = SetupWizard::new();
@@ -2167,13 +2455,61 @@ mod tests {
         assert_eq!(w.step, Step::MaxTurns);
         assert_eq!(w.draft().context_window, Some(131_072));
 
-        // Esc 链:验证 → 弱网重试 → 轮数上限 → 上下文窗口
+        // Esc 链:验证 → 网络代理 → 弱网重试 → 轮数上限 → 上下文窗口
         w.step = Step::Verifying;
+        w.on_key(key(KeyCode::Esc));
+        assert_eq!(w.step, Step::Proxy);
         w.on_key(key(KeyCode::Esc));
         assert_eq!(w.step, Step::Retry);
         w.on_key(key(KeyCode::Esc));
         assert_eq!(w.step, Step::MaxTurns);
         w.on_key(key(KeyCode::Esc));
         assert_eq!(w.step, Step::ContextWindow);
+    }
+
+    /// need03 U11:全向导代理步骤链（Retry -Enter→ Proxy -s→ Verifying -Esc→ Proxy -Esc→ Retry；
+    /// 档位键/手输/回退与 quick_cfg 同口径）
+    #[test]
+    fn proxy_step_chain_edits_and_verifies() {
+        let mut w = SetupWizard::new();
+        w.provider = "ollama".into();
+        w.model = "qwen3:8b".into();
+        w.step = Step::Retry;
+        // Enter → 代理步
+        assert!(matches!(w.on_key(key(KeyCode::Enter)), WizardAction::None));
+        assert_eq!(w.step, Step::Proxy);
+        // ↓ 到直连即时落值
+        w.on_key(key(KeyCode::Down));
+        assert_eq!(w.proxy.mode, ProxyMode::Off);
+        assert_eq!(w.draft().proxy, znaide_core::config::EffectiveProxy::Direct);
+        // y 回跟随环境
+        w.on_key(key(KeyCode::Char('y')));
+        assert_eq!(w.proxy.mode, ProxyMode::Auto);
+        // 手输合法地址进 Manual（draft 落定带上待存代理）
+        w.on_key(key(KeyCode::Char('e')));
+        assert!(w.typing && w.typing_proxy);
+        for c in "http://127.0.0.1:10808".chars() {
+            w.on_key(key(KeyCode::Char(c)));
+        }
+        w.on_key(key(KeyCode::Enter));
+        assert_eq!(w.proxy.mode, ProxyMode::Manual);
+        assert_eq!(
+            w.draft().proxy,
+            znaide_core::config::EffectiveProxy::Via("http://127.0.0.1:10808".into())
+        );
+        // s → 验证（探针走待存代理）
+        match w.on_key(key(KeyCode::Char('s'))) {
+            WizardAction::Verify(r) => assert_eq!(
+                r.proxy,
+                znaide_core::config::EffectiveProxy::Via("http://127.0.0.1:10808".into())
+            ),
+            _ => panic!("s 应触发验证"),
+        }
+        assert_eq!(w.step, Step::Verifying);
+        // Esc 回代理，再 Esc 回重试
+        w.on_key(key(KeyCode::Esc));
+        assert_eq!(w.step, Step::Proxy);
+        w.on_key(key(KeyCode::Esc));
+        assert_eq!(w.step, Step::Retry);
     }
 }

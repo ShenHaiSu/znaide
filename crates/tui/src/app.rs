@@ -351,6 +351,18 @@ fn quick_cfg_save(
         QcItem::SessionHeader => {
             cfg.save_session_header(provider, panel.session_header)?;
         }
+        QcItem::Proxy => {
+            cfg.save_proxy(panel.proxy.clone())?;
+            // Off/环境覆盖时的诚实提示（照抄 MaxTurns/Retry 的 extra 口径）
+            if std::env::var("ZNAIDE_PROXY")
+                .map(|v| !v.trim().is_empty())
+                .unwrap_or(false)
+            {
+                extra =
+                    "(当前代理被 ZNAIDE_PROXY 环境变量覆盖，文件已存但本次运行仍以环境变量为准)"
+                        .into();
+            }
+        }
     }
     Ok(extra)
 }
@@ -430,6 +442,8 @@ pub async fn run(
     let session_header_enabled = resolved.session_header_enabled;
     // 弱网重试同样 spawn 前取出(RetryConfig 是 Copy)
     let session_retry = resolved.retry;
+    // 生效代理同样 spawn 前取出(url 字符串；Session/更新检查/工具链路共用同一份快照)
+    let session_proxy_url: Option<String> = resolved.proxy.url().map(|s| s.to_string());
     let (ev_tx, mut ev_rx) = mpsc::unbounded_channel::<SessionEvent>();
     let (cmd_tx, mut cmd_rx) = mpsc::unbounded_channel::<AgentCmd>();
     // 更新进度/结果通知(update task → UI)
@@ -666,9 +680,11 @@ pub async fn run(
     // 任一源连通即用(Gitee 优先,国内直连无需代理)。
     {
         let update_tx = update_tx.clone();
+        let proxy_url = session_proxy_url.clone();
         tokio::spawn(async move {
             tokio::time::sleep(std::time::Duration::from_secs(2)).await;
-            let Ok(client) = znaide_core::update::http_client() else {
+            let Ok(client) = znaide_core::update::http_client_with_proxy(proxy_url.as_deref())
+            else {
                 return;
             };
             let Ok((src, latest)) = znaide_core::update::probe_latest(&client).await else {
@@ -1129,6 +1145,7 @@ pub async fn run(
                         base_url,
                         api_key,
                         session_header,
+                        proxy,
                     } => {
                         // 保留向导(Querying 状态),后台查询模型
                         config_wizard = Some(wizard);
@@ -1138,6 +1155,7 @@ pub async fn run(
                                 &base_url,
                                 api_key.as_deref(),
                                 session_header.as_deref(),
+                                &proxy,
                             )
                             .await;
                             let _ = tx.send(WizardReply::Models(r.map_err(|e| format!("{e:#}"))));
@@ -1163,14 +1181,13 @@ pub async fn run(
                         quick_cfg = Some(qc);
                     }
                     QuickCfgAction::Exit => {
-                        items.push(MsgItem::Notice(
-                            "已关闭按需配置(随时 /cfg 再开)。".into(),
-                        ));
+                        items.push(MsgItem::Notice("已关闭按需配置(随时 /cfg 再开)。".into()));
                     }
                     QuickCfgAction::FetchModels {
                         base_url,
                         api_key,
                         session_header,
+                        proxy,
                     } => {
                         quick_cfg = Some(qc);
                         let tx = wiz_tx.clone();
@@ -1179,6 +1196,7 @@ pub async fn run(
                                 &base_url,
                                 api_key.as_deref(),
                                 session_header.as_deref(),
+                                &proxy,
                             )
                             .await;
                             let _ = tx.send(WizardReply::Models(r.map_err(|e| format!("{e:#}"))));
@@ -1535,6 +1553,8 @@ pub async fn run(
                                 cfg.max_turns = w.max_turns;
                                 // 弱网重试一起落盘(顶层 retry，默认关闭)
                                 cfg.retry = w.retry;
+                                // 网络代理一起落盘(顶层 proxy，默认跟随环境；save() 7 参不动)
+                                cfg.proxy = w.proxy.clone();
                                 // Key 来自环境变量时不写明文(留空即保持环境变量那条路)
                                 let key_arg = if w.key_from_env {
                                     None
@@ -1956,9 +1976,17 @@ fn handle_command(
                 "正在检查更新…(Gitee 优先,不通自动切 GitHub)".into(),
             ));
             let tx = update_tx.clone();
+            // 生效代理现算（文件值 + ENV；handle_command 拿不到 current_resolved，
+            // 但 /cfg 保存后已落盘，现算结果与 current_resolved.proxy 一致）
+            let proxy_url: Option<String> = znaide_core::config::Config::load()
+                .ok()
+                .map(|c| c.resolve_proxy(None, false))
+                .and_then(|p| p.url().map(|s| s.to_string()));
             tokio::spawn(async move {
                 let cur = znaide_core::update::current_version();
-                let msg = znaide_core::update::perform_update().await.describe(&cur);
+                let msg = znaide_core::update::perform_update_with_proxy(proxy_url.as_deref())
+                    .await
+                    .describe(&cur);
                 let _ = tx.send(msg);
             });
         }

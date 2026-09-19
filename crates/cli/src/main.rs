@@ -73,17 +73,28 @@ struct Cli {
     #[arg(long)]
     no_retry: bool,
 
+    /// 全局网络代理（当次生效，不写盘）。示例：--proxy http://127.0.0.1:10808
+    #[arg(long, value_name = "URL")]
+    proxy: Option<String>,
+
+    /// 强制直连（忽略环境代理与配置文件；与 --proxy 同时传时以本项为准）
+    #[arg(long)]
+    no_proxy: bool,
+
     /// 检查并安装 GitHub 最新版本(见 --version 查看当前版本)
     #[arg(long)]
     update: bool,
 }
 
-/// 执行更新(--update):探测最新版 → 下载 → 自检 → 安装
-async fn run_update() -> anyhow::Result<()> {
+/// 执行更新(--update):探测最新版 → 下载 → 自检 → 安装。
+/// 代理现算（文件值 + CLI/ENV 覆盖），无会话快照可用。
+async fn run_update(cli_proxy: Option<String>, cli_no_proxy: bool) -> anyhow::Result<()> {
     use znaide_core::update::UpdateResult;
     let cur = znaide_core::update::current_version();
     println!("当前版本: v{cur}");
-    let r = znaide_core::update::perform_update().await;
+    let cfg = znaide_core::config::Config::load().unwrap_or_default();
+    let effective = cfg.resolve_proxy(cli_proxy, cli_no_proxy);
+    let r = znaide_core::update::perform_update_with_proxy(effective.url()).await;
     let msg = r.describe(&cur);
     // 失败进 stderr(脚本里能分辨),成功/无更新走 stdout
     match r {
@@ -103,7 +114,7 @@ async fn main() -> anyhow::Result<()> {
 
     // --update 与其它参数独立:不需要任何配置/会话
     if cli.update {
-        return run_update().await;
+        return run_update(cli.proxy.clone(), cli.no_proxy).await;
     }
 
     let mode = Mode::parse(&cli.permission)?;
@@ -162,6 +173,12 @@ async fn main() -> anyhow::Result<()> {
     if let Ok(r) = resolved.as_mut() {
         r.retry = retry_override;
     }
+    // 全局代理：CLI(--proxy/--no-proxy) > ENV > config 文件，当次生效不写盘。
+    // 代理不是模型配置，单给 --proxy 不撑起首启判定（config_provided 不加它）。
+    let proxy_override = cfg.resolve_proxy(cli.proxy.clone(), cli.no_proxy);
+    if let Ok(r) = resolved.as_mut() {
+        r.proxy = proxy_override;
+    }
     let cwd = cli.cwd.clone().unwrap_or(std::env::current_dir()?);
     if !cwd.is_dir() {
         anyhow::bail!("工作目录不存在: {}", cwd.display());
@@ -195,6 +212,7 @@ async fn main() -> anyhow::Result<()> {
                     protocol: znaide_core::config::ProtocolKind::Chat,
                     session_header_enabled: false,
                     retry: znaide_core::config::RetryConfig::disabled(),
+                    proxy: znaide_core::config::EffectiveProxy::Direct,
                 }
             });
             // --resume:按 ID/文件名片段定位历史文件,启动即恢复

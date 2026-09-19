@@ -7,7 +7,7 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
 use tokio::time::{timeout, Duration};
 use tokio_util::sync::CancellationToken;
-use znaide_core::config::{Resolved, RetryConfig};
+use znaide_core::config::{EffectiveProxy, Resolved, RetryConfig};
 use znaide_core::llm::build_llm_client;
 use znaide_core::permissions::Mode;
 use znaide_core::session::Session;
@@ -112,6 +112,7 @@ fn test_cfg(base: String) -> Resolved {
         protocol: znaide_core::config::ProtocolKind::Chat,
         session_header_enabled: false,
         retry: RetryConfig::disabled(),
+        proxy: EffectiveProxy::Direct,
     }
 }
 

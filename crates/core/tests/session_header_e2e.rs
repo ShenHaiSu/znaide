@@ -176,6 +176,7 @@ fn test_cfg(base: String, protocol: ProtocolKind, enabled: bool) -> Resolved {
         protocol,
         session_header_enabled: enabled,
         retry: znaide_core::config::RetryConfig::disabled(),
+        proxy: znaide_core::config::EffectiveProxy::Direct,
     }
 }
 

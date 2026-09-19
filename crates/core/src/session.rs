@@ -184,6 +184,9 @@ pub struct Session {
     /// 弱网重试策略(默认关闭)。单次模型调用遇空回复/可重试错误时按次数重试，
     /// 统一退避；耗尽才算彻底失败。`set_retry` / `reconfigure` 更新。
     retry: crate::config::RetryConfig,
+    /// 生效代理快照（随 `reconfigure` 刷新；`web_fetch` 等工具经 ToolContext 用同一份）。
+    /// 新建时从 llm 读（与实际出口一致），之后以 resolved 为准。
+    proxy: crate::config::EffectiveProxy,
 }
 
 impl Session {
@@ -218,6 +221,8 @@ impl Session {
             (None, None)
         };
 
+        // 代理快照先从 llm 读（move 进 Self 前；与实际出口一致）
+        let proxy = llm.effective_proxy();
         let mut s = Self {
             llm,
             protocol,
@@ -237,6 +242,7 @@ impl Session {
             inbox: None,
             session_header_enabled,
             retry: crate::config::RetryConfig::disabled(),
+            proxy,
         };
         // ID 落定后立即把开关 + 真实 ID 推给 client(任何 llm 调用前)；
         // 关 → client 保持无头
@@ -283,6 +289,8 @@ impl Session {
         self.set_session_header(resolved.session_header_enabled);
         // 重试策略同样即时生效(/config 改完下一轮调用即用新值)
         self.set_retry(resolved.retry);
+        // 代理快照同样即时生效（工具链路下一轮即用新出口；llm 侧已在上游重建）
+        self.proxy = resolved.proxy.clone();
     }
 
     /// 设置单条消息的轮数上限(0 = 不限)。CLI `--max-turns` 与 config 的
@@ -1271,6 +1279,7 @@ impl Session {
                     session_id: &self.session_id,
                     cancel: Some(self.cancel.clone()),
                     events: self.events.as_ref(),
+                    proxy_url: self.proxy.url().map(|s| s.to_string()),
                 };
                 match tools::execute(&name, args, &ctx).await {
                     Ok(out) => {
@@ -1346,6 +1355,7 @@ impl Session {
                                 session_id: &self.session_id,
                                 cancel: Some(self.cancel.clone()),
                                 events: self.events.as_ref(),
+                                proxy_url: self.proxy.url().map(|s| s.to_string()),
                             };
                             match tools::execute("run_shell_command", run_args, &ctx).await {
                                 Ok(o) => {

@@ -1,5 +1,5 @@
 use crate::config::Resolved;
-use crate::llm::client::{http_error, new_http_client, truncate, LlmClient};
+use crate::llm::client::{http_error, new_http_client_with_proxy, truncate, LlmClient};
 use crate::llm::sse::SseParser;
 use crate::llm::types::{ChatMessage, FunctionCall, ToolCall, ToolDef, Usage};
 use futures_util::StreamExt;
@@ -14,6 +14,8 @@ pub struct OpenAiClient {
     model: String,
     /// 稳定会话头的值(Some = 开，None = 关)。空串 = 开但真实会话 ID 未到(占位，不发头)。
     session_header: Option<String>,
+    /// 生效代理快照（与 base_url/model/api_key 并列的连接属性；变化即重建 http）
+    proxy: crate::config::EffectiveProxy,
 }
 
 /// 请求 user 标识:chat 请求顶层 user 字段(遥测/实例区分用)
@@ -232,7 +234,7 @@ impl ToolCallAccumulator {
 
 impl OpenAiClient {
     pub fn new(cfg: &Resolved) -> anyhow::Result<Self> {
-        let http = new_http_client()?;
+        let http = new_http_client_with_proxy(cfg.proxy.url())?;
         Ok(Self {
             http,
             base_url: cfg.base_url.trim_end_matches('/').to_string(),
@@ -245,6 +247,7 @@ impl OpenAiClient {
             } else {
                 None
             },
+            proxy: cfg.proxy.clone(),
         })
     }
 
@@ -252,7 +255,7 @@ impl OpenAiClient {
         &self.model
     }
 
-    /// 运行时换端点/key/模型(不动 http client,连接池留着复用)
+    /// 运行时换端点/key/模型/代理(代理是 Builder 期 baked，换出口必须重建 http，连接池不复用)
     pub fn reconfigure(&mut self, cfg: &Resolved) {
         self.base_url = cfg.base_url.trim_end_matches('/').to_string();
         self.model = cfg.model.clone();
@@ -262,6 +265,17 @@ impl OpenAiClient {
             (false, _) => self.session_header = None,
             (true, Some(v)) if !v.is_empty() => self.session_header = Some(v),
             (true, _) => self.session_header = Some(String::new()),
+        }
+        if self.proxy != cfg.proxy {
+            // 代理是 Builder 期 baked，换出口必须重建 client（连接池不复用）；
+            // 重建失败（非法 URL 漏网）保留旧 client 安全降级
+            match new_http_client_with_proxy(cfg.proxy.url()) {
+                Ok(http) => {
+                    self.http = http;
+                    self.proxy = cfg.proxy.clone();
+                }
+                Err(e) => eprintln!("⚠ 代理切换时重建客户端失败({e:#})，仍用旧代理继续"),
+            }
         }
     }
 
@@ -533,6 +547,10 @@ impl LlmClient for OpenAiClient {
         OpenAiClient::set_session_header(self, enabled, session_id)
     }
 
+    fn effective_proxy(&self) -> crate::config::EffectiveProxy {
+        self.proxy.clone()
+    }
+
     fn chat<'a>(
         &'a self,
         messages: &'a [ChatMessage],
@@ -571,10 +589,12 @@ impl LlmClient for OpenAiClient {
 
 /// 向导用:拿临时端点/key 探测模型列表,不碰全局状态。
 /// 开关开时按开关带一次性探针头(验证阶段尚无正式 Session，仅走通缓存路由)。
+/// proxy = 待存代理快照（验证阶段的模型列表查询同样走待存代理）。
 pub async fn probe_models(
     base_url: &str,
     api_key: Option<&str>,
     session_header: Option<&str>,
+    proxy: &crate::config::EffectiveProxy,
 ) -> anyhow::Result<Vec<String>> {
     let cfg = crate::config::Resolved {
         model: "probe".into(),
@@ -586,6 +606,7 @@ pub async fn probe_models(
         protocol: crate::config::ProtocolKind::Chat,
         session_header_enabled: session_header.is_some(),
         retry: crate::config::RetryConfig::disabled(),
+        proxy: proxy.clone(),
     };
     let mut client = OpenAiClient::new(&cfg)?;
     if let Some(v) = session_header {
@@ -823,6 +844,7 @@ mod tests {
             protocol: crate::config::ProtocolKind::Chat,
             session_header_enabled: enabled,
             retry: crate::config::RetryConfig::disabled(),
+            proxy: crate::config::EffectiveProxy::Direct,
         }
     }
 
